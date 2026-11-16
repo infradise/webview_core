@@ -1,0 +1,19 @@
+name: webview_core_example
+description: Cross-platform testbed application demonstrating the zero-dependency webview_core plugin.
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.9.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  webview_core:
+    path: ../
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+flutter:
