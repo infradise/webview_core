@@ -30,6 +30,7 @@ class _HttpPreviewTabState extends State<HttpPreviewTab> {
   int _progress = 0;
   String _status = 'Ready';
   String _title = '';
+  int _evalCount = 0;
 
   WebViewController get _web => widget.model.http;
 
@@ -108,9 +109,12 @@ class _HttpPreviewTabState extends State<HttpPreviewTab> {
 
   Future<void> _evalTitle() async {
     final value = await _web.evaluateJavaScript('document.title');
+    final count = ++_evalCount;
     widget.model.log.add('[http] document.title = ${value ?? '(null)'}');
     if (mounted) {
-      setState(() => _status = 'document.title = ${value ?? '(null)'}');
+      setState(
+        () => _status = 'document.title = ${value ?? '(null)'} (eval #$count)',
+      );
     }
   }
 

@@ -14,6 +14,25 @@ void main() {
     }
   }
 
+  /// Taps `Eval title` until the HTTP preview answers with its page title.
+  /// Page load time differs between developer machines and CI runners, and the
+  /// status line carries a per-tap counter so a stale answer can never match.
+  var evalTaps = 0;
+  Future<bool> titleAnswered(WidgetTester tester) async {
+    for (var i = 0; i < 60; i++) {
+      await tester.tap(find.text('Eval title'));
+      evalTaps++;
+      await tester.pump(const Duration(milliseconds: 500));
+      final answer = find.textContaining(
+        'document.title = keyscope.dev (sample SSR page) (eval #$evalTaps)',
+      );
+      if (answer.evaluate().isNotEmpty) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   Future<void> openTab(WidgetTester tester, String label) async {
     await tester.tap(find.text(label));
     await tester.pump(const Duration(milliseconds: 250));
@@ -23,14 +42,11 @@ void main() {
     tester,
   ) async {
     await tester.pumpWidget(const WebViewCoreExampleApp());
-    await settle(tester, ms: 2500);
 
     // HTTP tab: native JS works after initial load.
-    await tester.tap(find.text('Eval title'));
-    await settle(tester, ms: 600);
     expect(
-      find.textContaining('document.title = keyscope.dev (sample SSR page)'),
-      findsOneWidget,
+      await titleAnswered(tester),
+      isTrue,
       reason: 'HTTP preview did not load / answer JS',
     );
 
@@ -44,12 +60,9 @@ void main() {
 
     // The HTTP view must still be alive after the cycles.
     await tester.tap(find.text('Scripts: stripped'));
-    await settle(tester, ms: 1500);
-    await tester.tap(find.text('Eval title'));
-    await settle(tester, ms: 600);
     expect(
-      find.textContaining('document.title = keyscope.dev (sample SSR page)'),
-      findsOneWidget,
+      await titleAnswered(tester),
+      isTrue,
       reason: 'HTTP preview died after tab cycling',
     );
 

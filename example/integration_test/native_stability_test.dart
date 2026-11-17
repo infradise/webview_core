@@ -186,6 +186,36 @@ void main() {
     }
   }
 
+  /// Polls [script] until it evaluates to [expected]. Asynchronous page loads
+  /// take very different times on developer machines and CI runners, so tests
+  /// wait for the observable condition instead of sleeping a fixed time.
+  Future<void> waitForJs(
+    WidgetTester tester,
+    WebViewController c,
+    String script,
+    String expected, {
+    String reason = '',
+  }) async {
+    String? last;
+    for (var i = 0; i < 300; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+      last = await _guard(c.evaluateJavaScript(script), 'poll $script');
+      if (last == expected) {
+        return;
+      }
+    }
+    fail(
+      'Timed out waiting for `$script` == "$expected" (last "$last"). $reason',
+    );
+  }
+
+  Future<void> waitForTitle(
+    WidgetTester tester,
+    WebViewController c,
+    String expected, {
+    String reason = '',
+  }) => waitForJs(tester, c, 'document.title', expected, reason: reason);
+
   testWidgets('A. JS round trip returns normalized scalar types', (
     tester,
   ) async {
@@ -231,15 +261,14 @@ void main() {
       baseUrl: _kBase,
     );
     await c.reload();
-    await settle(tester, ms: 2000);
-    final t = await _guard(
-      c.evaluateJavaScript(
-        'document.getElementById("h") ? '
-        'document.getElementById("h").innerText : "MISSING"',
-      ),
-      'body after reload',
+    await waitForJs(
+      tester,
+      c,
+      'document.getElementById("h") ? '
+          'document.getElementById("h").innerText : "MISSING"',
+      'KEEP 7',
+      reason: 'reload() replaced the HTML with a fetch',
     );
-    expect(t, 'KEEP 7', reason: 'reload() replaced the HTML with a fetch');
     await tester.pumpWidget(const SizedBox.shrink());
     await c.dispose();
   });
@@ -258,11 +287,7 @@ void main() {
       );
       await tester.pump(const Duration(milliseconds: 8));
     }
-    await settle(tester, ms: 3000);
-    expect(
-      await _guard(c.evaluateJavaScript('document.title'), 'title'),
-      'T300',
-    );
+    await waitForTitle(tester, c, 'T300');
     await tester.pumpWidget(const SizedBox.shrink());
     await c.dispose();
   });
@@ -276,12 +301,7 @@ void main() {
       await tester.pumpWidget(const SizedBox.shrink());
       await tester.pump(const Duration(milliseconds: 50));
       await tester.pumpWidget(_Harness(controller: c, tab: tab));
-      await settle(tester, ms: 900);
-      final t = await _guard(
-        c.evaluateJavaScript('document.title'),
-        'title after remount $i',
-      );
-      expect(t, 'T5', reason: 'remount $i lost document');
+      await waitForTitle(tester, c, 'T5', reason: 'remount $i lost document');
     }
     await tester.pumpWidget(const SizedBox.shrink());
     await c.dispose();
@@ -342,11 +362,7 @@ void main() {
         showPreview: true,
         dark: true,
       );
-      await settle(tester, ms: 1500);
-      expect(
-        await _guard(c.evaluateJavaScript('document.title'), 'final title'),
-        'T300',
-      );
+      await waitForTitle(tester, c, 'T300');
       await tester.pumpWidget(const SizedBox.shrink());
       await c.dispose();
       state.dispose();
@@ -379,12 +395,8 @@ void main() {
       await tester.pump(const Duration(milliseconds: 15));
     }
     await tester.pump(const Duration(milliseconds: 200));
-    await settle(tester, ms: 2000);
+    await waitForTitle(tester, c, 'T400');
     debounce?.cancel();
-    expect(
-      await _guard(c.evaluateJavaScript('document.title'), 'title'),
-      'T400',
-    );
     await tester.pumpWidget(const SizedBox.shrink());
     await c.dispose();
   });
@@ -445,7 +457,7 @@ void main() {
           ),
     );
     await c.loadHtmlString(_html(2), baseUrl: _kBase);
-    await settle(tester);
+    await waitForTitle(tester, c, 'T2');
     await c.runJavaScript('Bridge.postMessage("ping-" + document.title)');
     for (var i = 0; i < 30 && !message.isCompleted; i++) {
       await tester.pump(const Duration(milliseconds: 100));
@@ -489,7 +501,7 @@ void main() {
     );
     expect(await manager.clearCookies(), isTrue);
     await c.loadHtmlString(_html(4), baseUrl: _kBase);
-    await settle(tester);
+    await waitForTitle(tester, c, 'T4');
     expect(
       await _guard(c.evaluateJavaScript('document.cookie'), 'cookie2'),
       isNot(contains('wvcore=ok')),
