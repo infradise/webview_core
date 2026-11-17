@@ -536,63 +536,147 @@ void main() {
     await c.dispose();
   });
 
-  testWidgets('L. right click (context menu) does not stall the native bridge', (
-    tester,
-  ) async {
-    final c = WebViewController();
-    final finished = Completer<void>();
-    await c.setJavaScriptMode(JavaScriptMode.unrestricted);
-    await c.setNavigationDelegate(
-      NavigationDelegate(
-        onPageFinished: (String _) {
-          if (!finished.isCompleted) {
-            finished.complete();
-          }
-        },
-      ),
-    );
-    await c.loadHtmlString(
-      '<!DOCTYPE html><html><body style="margin:0"><div style="height:400px">'
-      'hello<script>window.__cm=0;'
-      'document.addEventListener("contextmenu",function(){window.__cm++});'
-      '</script></div></body></html>',
-      baseUrl: _kBase,
-    );
-    await tester.pumpWidget(
-      Directionality(
-        textDirection: TextDirection.ltr,
-        child: SizedBox.expand(child: WebViewWidget(controller: c)),
-      ),
-    );
-    for (var i = 0; i < 60 && !finished.isCompleted; i++) {
+  testWidgets(
+    'L. right click (context menu) does not stall the native bridge',
+    (tester) async {
+      final c = WebViewController();
+      final finished = Completer<void>();
+      await c.setJavaScriptMode(JavaScriptMode.unrestricted);
+      await c.setNavigationDelegate(
+        NavigationDelegate(
+          onPageFinished: (String _) {
+            if (!finished.isCompleted) {
+              finished.complete();
+            }
+          },
+        ),
+      );
+      await c.loadHtmlString(
+        '<!DOCTYPE html><html><body style="margin:0"><div style="height:400px">'
+        'hello<script>window.__cm=0;'
+        'document.addEventListener("contextmenu",function(){window.__cm++});'
+        '</script></div></body></html>',
+        baseUrl: _kBase,
+      );
+      await tester.pumpWidget(
+        Directionality(
+          textDirection: TextDirection.ltr,
+          child: SizedBox.expand(child: WebViewWidget(controller: c)),
+        ),
+      );
+      for (var i = 0; i < 60 && !finished.isCompleted; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      expect(
+        finished.isCompleted,
+        isTrue,
+        reason: 'initial page never finished',
+      );
+      await settle(tester, ms: 1000);
+
+      final center = tester.getCenter(find.byType(WebViewWidget));
+      final gesture = await tester.startGesture(
+        center,
+        kind: PointerDeviceKind.mouse,
+        buttons: kSecondaryMouseButton,
+      );
+      await tester.pump(const Duration(milliseconds: 50));
+      await gesture.up();
+      await settle(tester, ms: 1500);
+
+      // A context menu shown synchronously inside the WebView2 event handler
+      // blocks every later native call until the menu is closed.
+      expect(
+        await _guard(c.evaluateJavaScript('1+1'), 'eval after right click'),
+        '2',
+        reason: 'native bridge stalled after a right click',
+      );
+      if (defaultTargetPlatform == TargetPlatform.windows) {
+        await waitForJs(
+          tester,
+          c,
+          'String(window.__cm)',
+          '1',
+          reason: 'right click never reached the page',
+        );
+      }
+      await tester.pumpWidget(const SizedBox.shrink());
+      await c.dispose();
+    },
+  );
+
+  testWidgets(
+    'M. left click reaches DOM and sibling Flutter controls remain responsive',
+    (tester) async {
+      var siblingTaps = 0;
+      final c = WebViewController();
+      final finished = Completer<void>();
+      await c.setJavaScriptMode(JavaScriptMode.unrestricted);
+      await c.setNavigationDelegate(
+        NavigationDelegate(
+          onPageFinished: (String _) {
+            if (!finished.isCompleted) {
+              finished.complete();
+            }
+          },
+        ),
+      );
+      await c.loadHtmlString(
+        '<!DOCTYPE html><html><body style="margin:0">'
+        '<div id="pad" onclick="window.__clicks=(window.__clicks||0)+1" '
+        'style="width:100vw;height:100vh">click target</div>'
+        '</body></html>',
+        baseUrl: _kBase,
+      );
+      await tester.pumpWidget(
+        Directionality(
+          textDirection: TextDirection.ltr,
+          child: Column(
+            children: <Widget>[
+              GestureDetector(
+                key: const ValueKey<String>('sibling_btn'),
+                behavior: HitTestBehavior.opaque,
+                onTap: () => siblingTaps++,
+                child: const SizedBox(width: 300, height: 48),
+              ),
+              Expanded(child: WebViewWidget(controller: c)),
+            ],
+          ),
+        ),
+      );
+      for (var i = 0; i < 60 && !finished.isCompleted; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      expect(
+        finished.isCompleted,
+        isTrue,
+        reason: 'initial page never finished',
+      );
+
+      await tester.tap(
+        find.byType(WebViewWidget),
+        kind: PointerDeviceKind.mouse,
+      );
       await tester.pump(const Duration(milliseconds: 100));
-    }
-    expect(finished.isCompleted, isTrue, reason: 'initial page never finished');
-    await settle(tester, ms: 1000);
+      if (defaultTargetPlatform == TargetPlatform.windows) {
+        await waitForJs(
+          tester,
+          c,
+          'String(window.__clicks||0)',
+          '1',
+          reason: 'left click never reached DOM in composition host',
+        );
+      }
 
-    final center = tester.getCenter(find.byType(WebViewWidget));
-    final gesture = await tester.startGesture(
-      center,
-      kind: PointerDeviceKind.mouse,
-      buttons: kSecondaryMouseButton,
-    );
-    await tester.pump(const Duration(milliseconds: 50));
-    await gesture.up();
-    await settle(tester, ms: 1500);
+      await tester.tap(
+        find.byKey(const ValueKey<String>('sibling_btn')),
+        kind: PointerDeviceKind.mouse,
+      );
+      await tester.pump();
+      expect(siblingTaps, 1, reason: 'sibling Flutter control stopped working');
 
-    // A context menu shown synchronously inside the WebView2 event handler
-    // blocks every later native call until the menu is closed.
-    expect(
-      await _guard(c.evaluateJavaScript('1+1'), 'eval after right click'),
-      '2',
-      reason: 'native bridge stalled after a right click',
-    );
-    expect(
-      await _guard(c.evaluateJavaScript('String(window.__cm)'), 'cm count'),
-      '1',
-      reason: 'right click never reached the page',
-    );
-    await tester.pumpWidget(const SizedBox.shrink());
-    await c.dispose();
-  });
+      await tester.pumpWidget(const SizedBox.shrink());
+      await c.dispose();
+    },
+  );
 }

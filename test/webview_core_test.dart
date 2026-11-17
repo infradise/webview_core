@@ -727,4 +727,50 @@ void main() {
       debugDefaultTargetPlatformOverride = null;
     },
   );
+
+  testWidgets(
+    'Windows host releases active mouse buttons before leave on PointerCancelEvent',
+    (WidgetTester tester) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+
+      final controller = WebViewController();
+      await controller.loadHtmlString('<p>cancel</p>');
+
+      await tester.pumpWidget(
+        Directionality(
+          textDirection: TextDirection.ltr,
+          child: SizedBox(
+            width: 200,
+            height: 100,
+            child: WebViewWidget(controller: controller),
+          ),
+        ),
+      );
+      await tester.pump();
+
+      recordedCalls.clear();
+      final gesture = await tester.startGesture(
+        tester.getCenter(find.byType(Texture)),
+        kind: PointerDeviceKind.mouse,
+      );
+      await tester.pump();
+      await gesture.cancel();
+      await tester.pump();
+
+      final pointerKinds = recordedCalls
+          .where((MethodCall c) => c.method == 'pointerEvent')
+          .map((MethodCall c) {
+            final args = c.arguments as Map<Object?, Object?>;
+            return '${args['kind']}:${args['button']}';
+          })
+          .toList();
+      expect(
+        pointerKinds,
+        containsAllInOrder(<String>['down:1', 'up:1', 'leave:0']),
+      );
+
+      await controller.dispose();
+      debugDefaultTargetPlatformOverride = null;
+    },
+  );
 }

@@ -7,6 +7,7 @@
 #include <flutter/texture_registrar.h>
 
 #include <windows.h>
+#include <commctrl.h>
 #include <d3d11.h>
 #include <dxgi.h>
 #include <roapi.h>
@@ -615,6 +616,169 @@ void TrimTrailingMenuSeparator(HMENU menu) {
   }
 }
 
+constexpr const wchar_t kCompositionHostClassName[] =
+    L"WebviewCoreCompositionHost";
+constexpr const wchar_t kInternalWebViewHwndProp[] =
+    L"WebviewCoreInternalHwnd";
+constexpr const wchar_t kHostFlutterViewProp[] =
+    L"WebviewCoreFlutterViewHwnd";
+constexpr UINT_PTR kFlutterViewGuardSubclassId = 0x57564331u;
+
+bool IsInternalWebViewWindow(HWND candidate) {
+  HWND cur = candidate;
+  for (int depth = 0; depth < 8 && cur != nullptr; ++depth) {
+    if (::GetPropW(cur, kInternalWebViewHwndProp) != nullptr) {
+      return true;
+    }
+    cur = ::GetParent(cur);
+  }
+  return false;
+}
+
+bool IsAnyMouseButtonPressed() {
+  return (::GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0 ||
+         (::GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0 ||
+         (::GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0;
+}
+
+// Shields Flutter's view HWND (`FLUTTERVIEW`) from losing Win32 keyboard focus
+// or mouse capture to WebView2's internal `Chrome_WidgetWin_*` child HWND.
+//
+// In composition hosting all pointer and keyboard input flows through Flutter
+// (`Listener` / `Focus`) -> MethodChannel -> `SendMouseInput` / `ExecuteScript`.
+// If WebView2 steals `GetCapture()` during a mouse press, `FLUTTERVIEW` misses
+// `WM_LBUTTONUP` and WebView2 never receives `SendMouseInput(UP)`, wedging
+// pointer input across the entire host window until the WebView is hidden.
+LRESULT CALLBACK FlutterViewInputGuardSubclass(HWND hwnd,
+                                               UINT msg,
+                                               WPARAM wp,
+                                               LPARAM lp,
+                                               UINT_PTR subclass_id,
+                                               DWORD_PTR /*ref_data*/) {
+  if (msg == WM_NCDESTROY) {
+    ::RemoveWindowSubclass(hwnd, FlutterViewInputGuardSubclass, subclass_id);
+    return ::DefSubclassProc(hwnd, msg, wp, lp);
+  }
+  if (msg == WM_KILLFOCUS) {
+    const HWND next = reinterpret_cast<HWND>(wp);
+    if (IsInternalWebViewWindow(next)) {
+      static thread_local bool restoring_focus = false;
+      if (!restoring_focus) {
+        restoring_focus = true;
+        ::SetFocus(hwnd);
+        restoring_focus = false;
+      }
+      return 0;
+    }
+  }
+  if (msg == WM_CAPTURECHANGED) {
+    const HWND next = reinterpret_cast<HWND>(lp);
+    if (IsInternalWebViewWindow(next)) {
+      static thread_local bool restoring_capture = false;
+      if (!restoring_capture) {
+        restoring_capture = true;
+        if (IsAnyMouseButtonPressed()) {
+          ::SetCapture(hwnd);
+        } else {
+          ::ReleaseCapture();
+        }
+        restoring_capture = false;
+      }
+      return 0;
+    }
+  }
+  return ::DefSubclassProc(hwnd, msg, wp, lp);
+}
+
+void EnsureFlutterViewGuarded(HWND flutter_hwnd) {
+  if (flutter_hwnd == nullptr || !::IsWindow(flutter_hwnd) ||
+      flutter_hwnd == ::GetDesktopWindow()) {
+    return;
+  }
+  DWORD_PTR existing = 0;
+  if (!::GetWindowSubclass(flutter_hwnd, FlutterViewInputGuardSubclass,
+                           kFlutterViewGuardSubclassId, &existing)) {
+    ::SetWindowSubclass(flutter_hwnd, FlutterViewInputGuardSubclass,
+                        kFlutterViewGuardSubclassId, 0);
+  }
+}
+
+LRESULT CALLBACK CompositionHostWndProc(HWND hwnd,
+                                        UINT msg,
+                                        WPARAM wp,
+                                        LPARAM lp) {
+  switch (msg) {
+    case WM_NCHITTEST:
+      return HTTRANSPARENT;
+    case WM_MOUSEACTIVATE:
+      return MA_NOACTIVATE;
+    case WM_PARENTNOTIFY:
+      if (LOWORD(wp) == WM_CREATE) {
+        const HWND child = reinterpret_cast<HWND>(lp);
+        if (child != nullptr && ::IsWindow(child)) {
+          ::SetPropW(child, kInternalWebViewHwndProp,
+                     reinterpret_cast<HANDLE>(1));
+        }
+      }
+      break;
+    case WM_SETFOCUS: {
+      const HWND flutter_view =
+          static_cast<HWND>(::GetPropW(hwnd, kHostFlutterViewProp));
+      if (flutter_view != nullptr && ::IsWindow(flutter_view) &&
+          flutter_view != hwnd) {
+        ::SetFocus(flutter_view);
+        return 0;
+      }
+      break;
+    }
+    case WM_NCDESTROY:
+      ::RemovePropW(hwnd, kInternalWebViewHwndProp);
+      ::RemovePropW(hwnd, kHostFlutterViewProp);
+      break;
+    default:
+      break;
+  }
+  return ::DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+HWND CreateCompositionHostWindow(HWND top_hwnd, HWND flutter_hwnd) {
+  static bool class_registered = false;
+  const HINSTANCE instance = ::GetModuleHandleW(nullptr);
+  if (!class_registered) {
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = CompositionHostWndProc;
+    wc.hInstance = instance;
+    wc.lpszClassName = kCompositionHostClassName;
+    if (::RegisterClassExW(&wc) != 0 ||
+        ::GetLastError() == ERROR_CLASS_ALREADY_EXISTS) {
+      class_registered = true;
+    }
+  }
+  if (!class_registered) {
+    return nullptr;
+  }
+  const HWND parent = (top_hwnd != nullptr && ::IsWindow(top_hwnd) &&
+                       top_hwnd != ::GetDesktopWindow())
+                          ? top_hwnd
+                          : flutter_hwnd;
+  const DWORD style = (parent != nullptr && parent != ::GetDesktopWindow())
+                          ? (WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS)
+                          : WS_POPUP;
+  const DWORD ex_style =
+      WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_NOPARENTNOTIFY;
+  const HWND host = ::CreateWindowExW(
+      ex_style, kCompositionHostClassName, L"", style, -32000, -32000, 1, 1,
+      parent, nullptr, instance, nullptr);
+  if (host != nullptr) {
+    ::SetPropW(host, kInternalWebViewHwndProp, reinterpret_cast<HANDLE>(1));
+    if (flutter_hwnd != nullptr && flutter_hwnd != ::GetDesktopWindow()) {
+      ::SetPropW(host, kHostFlutterViewProp, flutter_hwnd);
+    }
+  }
+  return host;
+}
+
 class WebviewCorePlugin;
 
 // Result sink for plugin-internal calls that have no Dart caller waiting.
@@ -754,6 +918,7 @@ class WindowsWebViewInstance
   void SetSizeInternal(int width, int height, double scale_factor);
   void SetVisibilityInternal(bool visible);
   void HandlePointerEvent(const flutter::EncodableMap& args);
+  void RestoreFlutterViewInputState(HWND prev_focus, HWND prev_capture);
   void HandleKeyEvent(const flutter::EncodableMap& args);
   HRESULT HandleContextMenuRequested(
       ICoreWebView2ContextMenuRequestedEventArgs* args);
@@ -778,6 +943,8 @@ class WindowsWebViewInstance
   flutter::TextureRegistrar* texture_registrar_ = nullptr;
   CompositionGraphicsRuntime* gfx_ = nullptr;
   HWND parent_hwnd_ = nullptr;
+  HWND top_hwnd_ = nullptr;
+  HWND host_hwnd_ = nullptr;
 
   int64_t texture_id_ = -1;
   bool use_gpu_surface_ = false;
@@ -821,6 +988,8 @@ class WindowsWebViewInstance
   bool has_context_menu_token_ = false;
   EventRegistrationToken new_window_token_{};
   bool has_new_window_token_ = false;
+  EventRegistrationToken move_focus_token_{};
+  bool has_move_focus_token_ = false;
   std::wstring channel_script_id_;
 
   std::string large_html_utf8_;
@@ -1401,6 +1570,12 @@ void WindowsWebViewInstance::Initialize(
     return;
   }
   parent_hwnd_ = parent_hwnd;
+  if (parent_hwnd != nullptr && parent_hwnd != ::GetDesktopWindow() &&
+      ::IsWindow(parent_hwnd)) {
+    top_hwnd_ = ::GetAncestor(parent_hwnd, GA_ROOT);
+    EnsureFlutterViewGuarded(parent_hwnd);
+  }
+  host_hwnd_ = CreateCompositionHostWindow(top_hwnd_, parent_hwnd_);
   env3_ = env3;
   js_enabled_ = GetBoolArg(creation_args, "javaScriptEnabled", true);
   zoom_enabled_ = GetBoolArg(creation_args, "zoomEnabled", true);
@@ -1435,9 +1610,11 @@ void WindowsWebViewInstance::Initialize(
     return;
   }
 
+  const HWND composition_parent =
+      host_hwnd_ != nullptr ? host_hwnd_ : parent_hwnd_;
   std::weak_ptr<WindowsWebViewInstance> weak_self = shared_from_this();
   env3_->CreateCoreWebView2CompositionController(
-      parent_hwnd,
+      composition_parent,
       Callback<ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler>(
           [weak_self, creation_args](
               HRESULT result,
@@ -1460,6 +1637,40 @@ void WindowsWebViewInstance::Initialize(
                 !self->webview_) {
               self->CancelPendingOps();
               return S_OK;
+            }
+
+            const HWND scan_parent = self->host_hwnd_ != nullptr
+                                         ? self->host_hwnd_
+                                         : self->parent_hwnd_;
+            if (scan_parent != nullptr && ::IsWindow(scan_parent)) {
+              for (HWND child = ::GetWindow(scan_parent, GW_CHILD);
+                   child != nullptr;
+                   child = ::GetWindow(child, GW_HWNDNEXT)) {
+                if (child != self->parent_hwnd_) {
+                  ::SetPropW(child, kInternalWebViewHwndProp,
+                             reinterpret_cast<HANDLE>(1));
+                }
+              }
+            }
+
+            if (SUCCEEDED(self->controller_->add_MoveFocusRequested(
+                    Callback<ICoreWebView2MoveFocusRequestedEventHandler>(
+                        [weak_self](
+                            ICoreWebView2Controller* /*sender*/,
+                            ICoreWebView2MoveFocusRequestedEventArgs* args)
+                            -> HRESULT {
+                          if (args != nullptr) {
+                            args->put_Handled(TRUE);
+                          }
+                          if (auto inst = weak_self.lock()) {
+                            inst->RestoreFlutterViewInputState(
+                                inst->parent_hwnd_, ::GetCapture());
+                          }
+                          return S_OK;
+                        })
+                        .Get(),
+                    &self->move_focus_token_))) {
+              self->has_move_focus_token_ = true;
             }
 
             if (self->container_visual_) {
@@ -1881,8 +2092,22 @@ void WindowsWebViewInstance::Dispose() {
     comp_controller_.Reset();
   }
   if (controller_) {
+    if (has_move_focus_token_) {
+      controller_->remove_MoveFocusRequested(move_focus_token_);
+      has_move_focus_token_ = false;
+    }
     controller_->Close();
     controller_.Reset();
+  }
+  if (host_hwnd_ != nullptr) {
+    if (::IsWindow(host_hwnd_)) {
+      for (HWND child = ::GetWindow(host_hwnd_, GW_CHILD); child != nullptr;
+           child = ::GetWindow(child, GW_HWNDNEXT)) {
+        ::RemovePropW(child, kInternalWebViewHwndProp);
+      }
+      ::DestroyWindow(host_hwnd_);
+    }
+    host_hwnd_ = nullptr;
   }
   if (frame_pool_ && has_frame_token_) {
     frame_pool_->remove_FrameArrived(frame_arrived_token_);
@@ -2231,7 +2456,11 @@ HRESULT WindowsWebViewInstance::HandleContextMenuRequested(
 void WindowsWebViewInstance::ShowContextMenu(
     ICoreWebView2ContextMenuRequestedEventArgs* args,
     ICoreWebView2ContextMenuItemCollection* items) {
-  if (args == nullptr || items == nullptr || parent_hwnd_ == nullptr) {
+  const HWND menu_owner =
+      (top_hwnd_ != nullptr && ::IsWindow(top_hwnd_)) ? top_hwnd_
+                                                      : parent_hwnd_;
+  if (args == nullptr || items == nullptr || menu_owner == nullptr ||
+      !::IsWindow(menu_owner)) {
     return;
   }
   HMENU menu = CreatePopupMenu();
@@ -2246,12 +2475,13 @@ void WindowsWebViewInstance::ShowContextMenu(
   if (GetMenuItemCount(menu) > 0) {
     POINT cursor{};
     GetCursorPos(&cursor);
-    SetForegroundWindow(parent_hwnd_);
+    SetForegroundWindow(menu_owner);
     const UINT picked = static_cast<UINT>(TrackPopupMenu(
         menu,
         TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN |
             TPM_RIGHTBUTTON,
-        cursor.x, cursor.y, 0, parent_hwnd_, nullptr));
+        cursor.x, cursor.y, 0, menu_owner, nullptr));
+    ::PostMessageW(menu_owner, WM_NULL, 0, 0);
     if (picked != 0) {
       const auto found = command_ids.find(picked);
       if (found != command_ids.end()) {
@@ -2259,6 +2489,11 @@ void WindowsWebViewInstance::ShowContextMenu(
       }
     }
     args->put_Handled(TRUE);
+    if (parent_hwnd_ != nullptr && parent_hwnd_ != ::GetDesktopWindow() &&
+        ::IsWindow(parent_hwnd_) && ::GetActiveWindow() == menu_owner &&
+        ::GetFocus() != parent_hwnd_) {
+      ::SetFocus(parent_hwnd_);
+    }
   }
   DestroyMenu(menu);
 }
@@ -2304,6 +2539,9 @@ void WindowsWebViewInstance::HandlePointerEvent(
   pt.x = static_cast<LONG>(std::lround(x));
   pt.y = static_cast<LONG>(std::lround(y));
 
+  const HWND prev_focus = ::GetFocus();
+  const HWND prev_capture = ::GetCapture();
+
   if (kind == "move") {
     comp_controller_->SendMouseInput(COREWEBVIEW2_MOUSE_EVENT_KIND_MOVE, vkeys,
                                      0, pt);
@@ -2347,16 +2585,46 @@ void WindowsWebViewInstance::HandlePointerEvent(
           COREWEBVIEW2_MOUSE_EVENT_KIND_HORIZONTAL_WHEEL, vkeys, wheel_x, pt);
     }
   }
+
+  RestoreFlutterViewInputState(prev_focus, prev_capture);
+}
+
+void WindowsWebViewInstance::RestoreFlutterViewInputState(
+    HWND prev_focus,
+    HWND prev_capture) {
+  if (parent_hwnd_ == nullptr || parent_hwnd_ == ::GetDesktopWindow() ||
+      !::IsWindow(parent_hwnd_)) {
+    return;
+  }
+  const HWND cur_capture = ::GetCapture();
+  if (cur_capture != prev_capture && IsInternalWebViewWindow(cur_capture)) {
+    if (prev_capture == parent_hwnd_ && IsAnyMouseButtonPressed()) {
+      ::SetCapture(parent_hwnd_);
+    } else {
+      ::ReleaseCapture();
+    }
+  }
+  const HWND cur_focus = ::GetFocus();
+  if (cur_focus != prev_focus && IsInternalWebViewWindow(cur_focus) &&
+      prev_focus == parent_hwnd_) {
+    ::SetFocus(parent_hwnd_);
+  }
 }
 
 void WindowsWebViewInstance::HandleKeyEvent(const flutter::EncodableMap& args) {
   if (!webview_ || !controller_) {
     return;
   }
-  if (parent_hwnd_ != nullptr && ::GetFocus() != parent_hwnd_) {
-    return;
+  if (parent_hwnd_ != nullptr && parent_hwnd_ != ::GetDesktopWindow() &&
+      ::GetFocus() != parent_hwnd_) {
+    const HWND active = ::GetActiveWindow();
+    if (active == parent_hwnd_ ||
+        (top_hwnd_ != nullptr && active == top_hwnd_)) {
+      ::SetFocus(parent_hwnd_);
+    } else {
+      return;
+    }
   }
-  controller_->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
 
   const std::string logical_key = GetStringArg(args, "logicalKey");
   bool has_char = false;
@@ -2446,13 +2714,19 @@ void WindowsWebViewInstance::HandleCall(
   }
 
   if (method == "setFocus") {
-    const bool focused = GetBoolArg(args, "focused", false);
-    if (focused) {
-      if (controller_) {
-        controller_->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+    // Keep Win32 HWND focus on `FLUTTERVIEW` (`parent_hwnd_`) at all times so
+    // Flutter continues to receive all pointer and keyboard messages. Calling
+    // `controller_->MoveFocus` moves Win32 focus into WebView2's internal child
+    // HWND, breaking Flutter input delivery; in-page DOM focus is driven by
+    // `SendMouseInput` clicks instead.
+    (void)args;
+    if (parent_hwnd_ != nullptr && parent_hwnd_ != ::GetDesktopWindow() &&
+        ::IsWindow(parent_hwnd_) && ::GetFocus() != parent_hwnd_) {
+      const HWND active = ::GetActiveWindow();
+      if (active == parent_hwnd_ ||
+          (top_hwnd_ != nullptr && active == top_hwnd_)) {
+        ::SetFocus(parent_hwnd_);
       }
-    } else if (parent_hwnd_ != nullptr && ::GetFocus() != parent_hwnd_) {
-      ::SetFocus(parent_hwnd_);
     }
     result->Success();
     return;

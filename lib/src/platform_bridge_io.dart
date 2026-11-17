@@ -1491,7 +1491,56 @@ class _WindowsWebViewHostState extends State<_WindowsWebViewHost> {
                 );
               },
               onPointerCancel: (PointerCancelEvent event) {
+                final prev = _activeButtons;
                 _activeButtons = 0;
+                final kb = HardwareKeyboard.instance;
+                final x = event.localPosition.dx * dpr;
+                final y = event.localPosition.dy * dpr;
+                if ((prev & kPrimaryMouseButton) != 0) {
+                  unawaited(
+                    widget.bridge.sendWindowsPointerEvent(
+                      controllerId: widget.params.controllerId,
+                      kind: 'up',
+                      button: 1,
+                      buttons: 0,
+                      x: x,
+                      y: y,
+                      shift: kb.isShiftPressed,
+                      control: kb.isControlPressed,
+                      alt: kb.isAltPressed,
+                    ),
+                  );
+                }
+                if ((prev & kSecondaryMouseButton) != 0) {
+                  unawaited(
+                    widget.bridge.sendWindowsPointerEvent(
+                      controllerId: widget.params.controllerId,
+                      kind: 'up',
+                      button: 2,
+                      buttons: 0,
+                      x: x,
+                      y: y,
+                      shift: kb.isShiftPressed,
+                      control: kb.isControlPressed,
+                      alt: kb.isAltPressed,
+                    ),
+                  );
+                }
+                if ((prev & kMiddleMouseButton) != 0) {
+                  unawaited(
+                    widget.bridge.sendWindowsPointerEvent(
+                      controllerId: widget.params.controllerId,
+                      kind: 'up',
+                      button: 3,
+                      buttons: 0,
+                      x: x,
+                      y: y,
+                      shift: kb.isShiftPressed,
+                      control: kb.isControlPressed,
+                      alt: kb.isAltPressed,
+                    ),
+                  );
+                }
                 unawaited(
                   widget.bridge.sendWindowsPointerEvent(
                     controllerId: widget.params.controllerId,
