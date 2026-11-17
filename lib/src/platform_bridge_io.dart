@@ -53,6 +53,38 @@ bool _isRenderSubtreeActive(RenderObject object) {
   return true;
 }
 
+/// Keys the Windows host never swallows so Flutter focus traversal, function
+/// key shortcuts, and modifier-only presses keep working while the WebView
+/// holds focus.
+final Set<LogicalKeyboardKey> _passThroughKeys = <LogicalKeyboardKey>{
+  LogicalKeyboardKey.escape,
+  LogicalKeyboardKey.tab,
+  LogicalKeyboardKey.f1,
+  LogicalKeyboardKey.f2,
+  LogicalKeyboardKey.f3,
+  LogicalKeyboardKey.f4,
+  LogicalKeyboardKey.f5,
+  LogicalKeyboardKey.f6,
+  LogicalKeyboardKey.f7,
+  LogicalKeyboardKey.f8,
+  LogicalKeyboardKey.f9,
+  LogicalKeyboardKey.f10,
+  LogicalKeyboardKey.f11,
+  LogicalKeyboardKey.f12,
+  LogicalKeyboardKey.shiftLeft,
+  LogicalKeyboardKey.shiftRight,
+  LogicalKeyboardKey.controlLeft,
+  LogicalKeyboardKey.controlRight,
+  LogicalKeyboardKey.altLeft,
+  LogicalKeyboardKey.altRight,
+  LogicalKeyboardKey.metaLeft,
+  LogicalKeyboardKey.metaRight,
+  LogicalKeyboardKey.capsLock,
+};
+
+bool _isPassThroughKey(LogicalKeyboardKey key) =>
+    _passThroughKeys.contains(key);
+
 /// Native platform implementation of [WebViewPlatformBridge].
 final class IoWebViewBridge extends WebViewPlatformBridge {
   /// Method channel shared across native WebView instances.
@@ -1251,10 +1283,10 @@ class _WindowsWebViewHostState extends State<_WindowsWebViewHost> {
       return KeyEventResult.ignored;
     }
     final key = event.logicalKey;
-    if (key == LogicalKeyboardKey.escape) {
+    final kb = HardwareKeyboard.instance;
+    if (_isPassThroughKey(key) || kb.isMetaPressed) {
       return KeyEventResult.ignored;
     }
-    final kb = HardwareKeyboard.instance;
     unawaited(
       widget.bridge.sendWindowsKeyEvent(
         controllerId: widget.params.controllerId,

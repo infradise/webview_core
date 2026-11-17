@@ -117,6 +117,11 @@ jobs:
         working-directory: example
         run: flutter test
 
+      - name: Run native integration tests (macOS)
+        if: matrix.platform == 'macos'
+        working-directory: example
+        run: flutter test integration_test -d macos
+
       - name: Build example (${{ matrix.platform }} debug)
         working-directory: example
         run: flutter build ${{ matrix.platform }} --debug

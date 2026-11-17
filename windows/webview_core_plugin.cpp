@@ -489,6 +489,107 @@ class CompositionGraphicsRuntime {
       winrt_d3d_device_;
 };
 
+// Builds a Win32 popup menu mirroring the WebView2 context menu model.
+//
+// In visual (composition) hosting WebView2 never displays its own context menu,
+// so the host must render the menu items it receives from
+// `ContextMenuRequested` and report the chosen command back to the engine.
+void AppendContextMenuItems(HMENU menu,
+                            ICoreWebView2ContextMenuItemCollection* items,
+                            std::map<UINT, INT32>* command_ids,
+                            UINT* next_id) {
+  if (menu == nullptr || items == nullptr || command_ids == nullptr ||
+      next_id == nullptr) {
+    return;
+  }
+  UINT32 count = 0;
+  if (FAILED(items->get_Count(&count))) {
+    return;
+  }
+  bool last_was_separator = true;
+  for (UINT32 i = 0; i < count; ++i) {
+    ComPtr<ICoreWebView2ContextMenuItem> item;
+    if (FAILED(items->GetValueAtIndex(i, &item)) || !item) {
+      continue;
+    }
+    COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND kind =
+        COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_COMMAND;
+    item->get_Kind(&kind);
+    if (kind == COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_SEPARATOR) {
+      if (!last_was_separator) {
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        last_was_separator = true;
+      }
+      continue;
+    }
+
+    std::wstring label;
+    LPWSTR label_raw = nullptr;
+    if (SUCCEEDED(item->get_Label(&label_raw)) && label_raw != nullptr) {
+      label = label_raw;
+      CoTaskMemFree(label_raw);
+    }
+    LPWSTR shortcut_raw = nullptr;
+    if (SUCCEEDED(item->get_ShortcutKeyDescription(&shortcut_raw)) &&
+        shortcut_raw != nullptr) {
+      if (shortcut_raw[0] != L'\0') {
+        label += L"\t";
+        label += shortcut_raw;
+      }
+      CoTaskMemFree(shortcut_raw);
+    }
+
+    BOOL enabled = TRUE;
+    item->get_IsEnabled(&enabled);
+    UINT flags = MF_STRING | (enabled ? MF_ENABLED : MF_GRAYED);
+
+    if (kind == COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_SUBMENU) {
+      ComPtr<ICoreWebView2ContextMenuItemCollection> children;
+      if (SUCCEEDED(item->get_Children(&children)) && children) {
+        HMENU submenu = CreatePopupMenu();
+        if (submenu != nullptr) {
+          AppendContextMenuItems(submenu, children.Get(), command_ids,
+                                 next_id);
+          AppendMenuW(menu, flags | MF_POPUP,
+                      reinterpret_cast<UINT_PTR>(submenu), label.c_str());
+          last_was_separator = false;
+        }
+      }
+      continue;
+    }
+
+    if (kind == COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_CHECK_BOX ||
+        kind == COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_RADIO) {
+      BOOL checked = FALSE;
+      item->get_IsChecked(&checked);
+      if (checked) {
+        flags |= MF_CHECKED;
+      }
+    }
+
+    INT32 command_id = 0;
+    item->get_CommandId(&command_id);
+    const UINT menu_id = (*next_id)++;
+    (*command_ids)[menu_id] = command_id;
+    AppendMenuW(menu, flags, menu_id, label.c_str());
+    last_was_separator = false;
+  }
+}
+
+void TrimTrailingMenuSeparator(HMENU menu) {
+  const int count = GetMenuItemCount(menu);
+  if (count <= 0) {
+    return;
+  }
+  MENUITEMINFOW info{};
+  info.cbSize = sizeof(info);
+  info.fMask = MIIM_FTYPE;
+  if (GetMenuItemInfoW(menu, static_cast<UINT>(count - 1), TRUE, &info) &&
+      (info.fType & MFT_SEPARATOR) != 0) {
+    DeleteMenu(menu, static_cast<UINT>(count - 1), MF_BYPOSITION);
+  }
+}
+
 class WebviewCorePlugin;
 
 struct PendingOp {
@@ -584,6 +685,8 @@ class WindowsWebViewInstance
   void SetVisibilityInternal(bool visible);
   void HandlePointerEvent(const flutter::EncodableMap& args);
   void HandleKeyEvent(const flutter::EncodableMap& args);
+  HRESULT HandleContextMenuRequested(
+      ICoreWebView2ContextMenuRequestedEventArgs* args);
   void RebuildChannelScript();
   void LoadHtmlInternal(const std::string& html, const std::string& base_url);
   void LoadRequestInternal(const std::string& url,
@@ -647,6 +750,10 @@ class WindowsWebViewInstance
   EventRegistrationToken web_message_token_{};
   EventRegistrationToken web_resource_token_{};
   bool has_web_resource_token_ = false;
+  EventRegistrationToken context_menu_token_{};
+  bool has_context_menu_token_ = false;
+  EventRegistrationToken new_window_token_{};
+  bool has_new_window_token_ = false;
   std::wstring channel_script_id_;
 
   std::string large_html_utf8_;
@@ -1393,6 +1500,59 @@ void WindowsWebViewInstance::Initialize(
                     .Get(),
                 &self->nav_starting_token_);
 
+            // Composition hosting renders no default context menu: surface the
+            // Edge menu (Back, Forward, Reload, Copy, ...) as a native popup.
+            ComPtr<ICoreWebView2_11> webview11;
+            if (SUCCEEDED(self->webview_.As(&webview11)) && webview11) {
+              if (SUCCEEDED(webview11->add_ContextMenuRequested(
+                      Callback<ICoreWebView2ContextMenuRequestedEventHandler>(
+                          [weak_self](
+                              ICoreWebView2* /*sender*/,
+                              ICoreWebView2ContextMenuRequestedEventArgs* args)
+                              -> HRESULT {
+                            auto inst = weak_self.lock();
+                            if (!inst || inst->disposed_ || args == nullptr) {
+                              return S_OK;
+                            }
+                            return inst->HandleContextMenuRequested(args);
+                          })
+                          .Get(),
+                      &self->context_menu_token_))) {
+                self->has_context_menu_token_ = true;
+              }
+            }
+
+            // target="_blank" / window.open(): embedded views have no tab
+            // strip, so open http(s) targets in place.
+            if (SUCCEEDED(self->webview_->add_NewWindowRequested(
+                    Callback<ICoreWebView2NewWindowRequestedEventHandler>(
+                        [weak_self](
+                            ICoreWebView2* sender,
+                            ICoreWebView2NewWindowRequestedEventArgs* args)
+                            -> HRESULT {
+                          auto inst = weak_self.lock();
+                          if (!inst || inst->disposed_ || args == nullptr) {
+                            return S_OK;
+                          }
+                          args->put_Handled(TRUE);
+                          LPWSTR uri_w = nullptr;
+                          if (SUCCEEDED(args->get_Uri(&uri_w)) &&
+                              uri_w != nullptr) {
+                            const std::wstring target(uri_w);
+                            CoTaskMemFree(uri_w);
+                            if (sender != nullptr &&
+                                (target.rfind(L"http://", 0) == 0 ||
+                                 target.rfind(L"https://", 0) == 0)) {
+                              sender->Navigate(target.c_str());
+                            }
+                          }
+                          return S_OK;
+                        })
+                        .Get(),
+                    &self->new_window_token_))) {
+              self->has_new_window_token_ = true;
+            }
+
             self->webview_->add_NavigationCompleted(
                 Callback<ICoreWebView2NavigationCompletedEventHandler>(
                     [weak_self](
@@ -1587,6 +1747,17 @@ void WindowsWebViewInstance::Dispose() {
     if (has_web_resource_token_) {
       webview_->remove_WebResourceRequested(web_resource_token_);
       has_web_resource_token_ = false;
+    }
+    if (has_context_menu_token_) {
+      ComPtr<ICoreWebView2_11> webview11;
+      if (SUCCEEDED(webview_.As(&webview11)) && webview11) {
+        webview11->remove_ContextMenuRequested(context_menu_token_);
+      }
+      has_context_menu_token_ = false;
+    }
+    if (has_new_window_token_) {
+      webview_->remove_NewWindowRequested(new_window_token_);
+      has_new_window_token_ = false;
     }
     webview_->remove_NavigationStarting(nav_starting_token_);
     webview_->remove_NavigationCompleted(nav_completed_token_);
@@ -1872,6 +2043,50 @@ void WindowsWebViewInstance::LoadRequestInternal(
 
   const std::wstring wurl = Utf8ToWide(url);
   webview_->Navigate(wurl.c_str());
+}
+
+HRESULT WindowsWebViewInstance::HandleContextMenuRequested(
+    ICoreWebView2ContextMenuRequestedEventArgs* args) {
+  if (args == nullptr || disposed_ || parent_hwnd_ == nullptr) {
+    return S_OK;
+  }
+  ComPtr<ICoreWebView2ContextMenuItemCollection> items;
+  if (FAILED(args->get_MenuItems(&items)) || !items) {
+    return S_OK;
+  }
+  UINT32 count = 0;
+  if (FAILED(items->get_Count(&count)) || count == 0) {
+    return S_OK;
+  }
+
+  HMENU menu = CreatePopupMenu();
+  if (menu == nullptr) {
+    return S_OK;
+  }
+  std::map<UINT, INT32> command_ids;
+  UINT next_id = 1;
+  AppendContextMenuItems(menu, items.Get(), &command_ids, &next_id);
+  TrimTrailingMenuSeparator(menu);
+
+  if (GetMenuItemCount(menu) > 0) {
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    SetForegroundWindow(parent_hwnd_);
+    const UINT picked = static_cast<UINT>(TrackPopupMenu(
+        menu,
+        TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN |
+            TPM_RIGHTBUTTON,
+        cursor.x, cursor.y, 0, parent_hwnd_, nullptr));
+    if (picked != 0) {
+      const auto found = command_ids.find(picked);
+      if (found != command_ids.end()) {
+        args->put_SelectedCommandId(found->second);
+      }
+    }
+    args->put_Handled(TRUE);
+  }
+  DestroyMenu(menu);
+  return S_OK;
 }
 
 void WindowsWebViewInstance::HandlePointerEvent(

@@ -27,10 +27,10 @@ Integrating WebView rendering across mobile, desktop, and WebAssembly in Flutter
 `webview_core` eliminates **every** external Pub, CocoaPods/SwiftPM, Gradle/Maven, and NuGet CLI dependency (`dependencies` contains **only** Flutter SDK packages: `flutter` and `flutter_web_plugins`):
 
 - **Android (`Kotlin` + `android.webkit.WebView`, minSdk 24, compileSdk 36)**: AGP 8.x and AGP 9.x Built-in Kotlin compatible with zero `androidx` dependencies, UTF-8 `loadDataWithBaseURL` rendering, main-frame `NavigationDecision.prevent` enforcement, non-GET `loadRequest` support, CSS logical-pixel scroll synchronization, and `@JavascriptInterface` channels.
-- **iOS (`Swift` + `WKWebView`, iOS 14.0+)**: Dual Swift Package Manager (`Package.swift`) and CocoaPods (`webview_core.podspec`) layout with `PrivacyInfo.xcprivacy`, `WKWebpagePreferences.allowsContentJavaScript`, `isOpaque = false` background synchronization, automatic unmount teardown without retain cycles, and zero deprecated APIs.
-- **Linux (`C++14` + `GTK3` + `webkit2gtk-4.1`)**: Compiles cleanly under Flutter's default `cxx_std_14` and Ubuntu 22.04 (`GLib 2.72.4`) headers, combining `GtkLayout` viewport clipping inside `GtkOverlay` with automatic `Visibility` / `IndexedStack` / `Offstage` / modal-route occlusion tracking so switching tabs or opening dialogs immediately calls `gtk_widget_hide()` with zero ghosting and zero idle CPU usage.
-- **macOS (`Swift` + `WKWebView`, macOS 11.0+)**: Dual Swift Package Manager (`Package.swift`) and CocoaPods (`webview_core.podspec`) layout with `PrivacyInfo.xcprivacy`, direct `WKWebView` `AppKitView` hit-testing and scrolling, full `setBackgroundColor` support (`drawsBackground = false` + `CALayer` / `underPageBackgroundColor` backdrop), and zero deprecated APIs.
-- **Windows (`C++17` + `WRL` + `WebView2LoaderStatic.lib` `x64`/`ARM64`)**: Compiles cleanly under `/W4 /WX` and `_HAS_EXCEPTIONS=0` without `nuget.exe` or `WIL`, compositing `ICoreWebView2CompositionController` frames via zero-copy DXGI shared GPU textures (`FlutterDesktopGpuSurfaceDescriptor`, with automatic `PixelBufferTexture` fallback on software WARP adapters) and supporting `> 2 MB` inline HTML documents via in-memory stream responses.
+- **iOS (`Swift` + `WKWebView`, iOS 14.0+)**: Dual Swift Package Manager (`Package.swift`) and CocoaPods (`webview_core.podspec`) layout with `PrivacyInfo.xcprivacy`, `WKWebpagePreferences.allowsContentJavaScript`, `isOpaque = false` background synchronization, automatic unmount teardown without retain cycles, and zero deprecated APIs. `target="_blank"` links open in place and a crashed `WebContent` process is reloaded automatically.
+- **Linux (`C++14` + `GTK3` + `webkit2gtk-4.1`)**: Compiles cleanly under Flutter's default `cxx_std_14` and Ubuntu 22.04 (`GLib 2.72.4`) headers, combining `GtkLayout` viewport clipping inside `GtkOverlay` with automatic `Visibility` / `IndexedStack` / `Offstage` / modal-route occlusion tracking so switching tabs or opening dialogs immediately calls `gtk_widget_hide()` with zero ghosting and zero idle CPU usage. Links with `target="_blank"` and `window.open()` open in place.
+- **macOS (`Swift` + `WKWebView`, macOS 11.0+)**: Dual Swift Package Manager (`Package.swift`) and CocoaPods (`webview_core.podspec`) layout with `PrivacyInfo.xcprivacy`, direct `WKWebView` `AppKitView` hit-testing and scrolling, full `setBackgroundColor` support (`drawsBackground = false` + `CALayer` / `underPageBackgroundColor` backdrop), and zero deprecated APIs. The native view survives any number of hide / show cycles (`IndexedStack`, `Offstage`, collapsing panels) and is released only when Flutter releases it or `WebViewController.dispose()` is called. A crashed `WebContent` process is reported through `onWebResourceError` (`webContentProcessTerminated`) and reloaded automatically; `target="_blank"` links open in place.
+- **Windows (`C++17` + `WRL` + `WebView2LoaderStatic.lib` `x64`/`ARM64`)**: Compiles cleanly under `/W4 /WX` and `_HAS_EXCEPTIONS=0` without `nuget.exe` or `WIL`, compositing `ICoreWebView2CompositionController` frames via zero-copy DXGI shared GPU textures (`FlutterDesktopGpuSurfaceDescriptor`, with automatic `PixelBufferTexture` fallback on software WARP adapters) and supporting `> 2 MB` inline HTML documents via in-memory stream responses. Right-click opens the standard Edge context menu (Back, Forward, Reload, Copy, …) rendered as a native popup, `target="_blank"` links open in place, and Tab / function keys / `Win` combinations are never swallowed by the WebView.
 - **Web / WebAssembly (`dart:js_interop` + `dart:ui_web`, `dart2wasm`-ready)**: Pure SDK `dart:js_interop` `HTMLIFrameElement` implementation (`srcdoc`, `src`, `sandbox`, CSS `rgba()` background, and source-verified `postMessage` channels) with zero `package:web` or `dart:html` imports.
 
 ## Compatibility Chart
@@ -48,6 +48,8 @@ Integrating WebView rendering across mobile, desktop, and WebAssembly in Flutter
 | `addJavaScriptChannel()` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ (`srcdoc`) |
 | `NavigationDelegate` | ✅ | ✅ | ✅ | ✅ | ✅ | ⚠️ `loadRequest` & load events |
 | `IndexedStack` / `Offstage` / modal instant hide | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Right-click context menu | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ (browser) |
+| `target="_blank"` / `window.open()` opens in place | ✅ (platform default) | ✅ | ✅ | ✅ | ✅ | ✅ (iframe) |
 | `WebViewCookieManager` | ✅ | ✅ | ✅ | ✅ | ✅ | ⚠️ `document.cookie` |
 | `setUserAgent()` / `enableZoom()` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | `clearCache()` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
@@ -64,7 +66,7 @@ Integrating WebView rendering across mobile, desktop, and WebAssembly in Flutter
 
 ```yaml
 dependencies:
-  webview_core: ^1.0.0
+  webview_core: ^1.1.0
 ```
 
 ## Import Barrels
@@ -169,6 +171,11 @@ unawaited(
 );
 unawaited(controller.loadRequest(Uri.parse('https://example.com')));
 ```
+
+## Testing
+
+- `flutter test` runs the Dart unit and widget tests (mocked platform channel).
+- `cd example && flutter test integration_test -d macos` runs the **native** integration tests against the real `WKWebView` plugin (hide / show, remount, rounded-clip resize storms, debounced typing, `target=_blank`, JavaScript channels, cookies, and the full example application). The same suite runs on `windows` and `linux` (`xvfb-run`) hosts.
 
 ## License
 

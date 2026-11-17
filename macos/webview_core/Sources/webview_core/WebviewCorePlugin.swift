@@ -26,24 +26,16 @@ private final class WeakInstanceBox {
 }
 
 private final class InteractiveWKWebView: WKWebView {
-  var owner: MacOSWebViewInstance?
-  private var hasAttachedToSuperview = false
+  /// Strongly retains the native bridge for exactly as long as this view lives.
+  ///
+  /// The Flutter engine owns the view (and detaches / re-attaches it freely while
+  /// a `WebViewWidget` is hidden by `IndexedStack`, `Offstage`, panel toggles,
+  /// etc.). The bridge therefore must NOT be torn down when the view merely
+  /// leaves its superview; it is released only when the engine releases the view.
+  var bridge: MacOSWebViewInstance?
 
   override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
     return true
-  }
-
-  override func viewDidMoveToSuperview() {
-    super.viewDidMoveToSuperview()
-    if superview != nil {
-      hasAttachedToSuperview = true
-      return
-    }
-    guard hasAttachedToSuperview else { return }
-    DispatchQueue.main.async { [weak self] in
-      guard let self = self, self.superview == nil else { return }
-      self.owner?.dispose()
-    }
   }
 }
 
@@ -79,7 +71,7 @@ public class WebviewCorePlugin: NSObject, FlutterPlugin {
       plugin: self
     )
     instances[controllerId] = WeakInstanceBox(instance)
-    return instance.webView
+    return instance.takeView()
   }
 
   fileprivate func removeInstance(controllerId: Int, instance: MacOSWebViewInstance) {
@@ -209,9 +201,13 @@ private final class MacOSWebViewFactory: NSObject, FlutterPlatformViewFactory {
 
 private final class MacOSWebViewInstance: NSObject,
   WKNavigationDelegate,
+  WKUIDelegate,
   WKScriptMessageHandler
 {
-  let webView: InteractiveWKWebView
+  /// The native view is owned by the Flutter engine; this bridge only observes it.
+  private weak var weakWebView: InteractiveWKWebView?
+  /// Strong hand-off slot used exactly once by `takeView()` during creation.
+  private var pendingView: InteractiveWKWebView?
   private let controllerId: Int
   private weak var plugin: WebviewCorePlugin?
   private var javaScriptEnabled: Bool
@@ -236,11 +232,14 @@ private final class MacOSWebViewInstance: NSObject,
     let configuration = WKWebViewConfiguration()
     configuration.defaultWebpagePreferences.allowsContentJavaScript = self.javaScriptEnabled
 
-    self.webView = InteractiveWKWebView(frame: .zero, configuration: configuration)
+    let webView = InteractiveWKWebView(frame: .zero, configuration: configuration)
     super.init()
 
-    webView.owner = self
+    self.weakWebView = webView
+    self.pendingView = webView
+    webView.bridge = self
     webView.navigationDelegate = self
+    webView.uiDelegate = self
     webView.autoresizesSubviews = true
     webView.wantsLayer = true
     webView.setValue(false, forKey: "drawsBackground")
@@ -304,33 +303,50 @@ private final class MacOSWebViewInstance: NSObject,
     }
   }
 
-  deinit {
-    dispose()
+  /// Hands the freshly created view to the engine (called exactly once).
+  func takeView() -> NSView {
+    defer { pendingView = nil }
+    return pendingView ?? NSView(frame: .zero)
   }
 
+  deinit {
+    // Reached only after the engine released the view (the view retains this
+    // bridge through `bridge`), so there is nothing left to detach.
+    releaseResources(view: nil)
+  }
+
+  /// Explicit teardown requested by Dart (`WebViewController.dispose`).
   func dispose() {
+    releaseResources(view: weakWebView)
+  }
+
+  private func releaseResources(view: InteractiveWKWebView?) {
     if isDisposed {
       return
     }
     isDisposed = true
-    webView.owner = nil
     progressObservation?.invalidate()
     progressObservation = nil
     urlObservation?.invalidate()
     urlObservation = nil
-    let controller = webView.configuration.userContentController
-    for name in registeredChannels {
-      controller.removeScriptMessageHandler(forName: name)
+    if let view = view {
+      let controller = view.configuration.userContentController
+      for name in registeredChannels {
+        controller.removeScriptMessageHandler(forName: name)
+      }
+      controller.removeAllUserScripts()
+      view.navigationDelegate = nil
+      view.uiDelegate = nil
+      view.stopLoading()
+      view.removeFromSuperview()
+      view.bridge = nil
     }
     registeredChannels.removeAll()
-    controller.removeAllUserScripts()
-    webView.navigationDelegate = nil
-    webView.stopLoading()
-    webView.removeFromSuperview()
     plugin?.removeInstance(controllerId: controllerId, instance: self)
   }
 
   private func applyBackgroundColor(_ argb: UInt32) {
+    guard let webView = weakWebView else { return }
     let a = CGFloat((argb >> 24) & 0xFF) / 255.0
     let r = CGFloat((argb >> 16) & 0xFF) / 255.0
     let g = CGFloat((argb >> 8) & 0xFF) / 255.0
@@ -344,6 +360,7 @@ private final class MacOSWebViewInstance: NSObject,
   }
 
   private func rebuildChannelUserScripts() {
+    guard let webView = weakWebView else { return }
     let controller = webView.configuration.userContentController
     controller.removeAllUserScripts()
     if !zoomEnabled {
@@ -375,7 +392,7 @@ private final class MacOSWebViewInstance: NSObject,
   }
 
   private func addChannelInternal(_ name: String) {
-    guard !registeredChannels.contains(name) else { return }
+    guard let webView = weakWebView, !registeredChannels.contains(name) else { return }
     registeredChannels.insert(name)
     webView.configuration.userContentController.add(
       WeakScriptMessageHandler(target: self),
@@ -385,7 +402,7 @@ private final class MacOSWebViewInstance: NSObject,
   }
 
   private func removeChannelInternal(_ name: String) {
-    guard registeredChannels.remove(name) != nil else { return }
+    guard let webView = weakWebView, registeredChannels.remove(name) != nil else { return }
     webView.configuration.userContentController.removeScriptMessageHandler(forName: name)
     rebuildChannelUserScripts()
   }
@@ -413,7 +430,7 @@ private final class MacOSWebViewInstance: NSObject,
       request.setValue(v, forHTTPHeaderField: k)
     }
     request.httpBody = body
-    webView.load(request)
+    weakWebView?.load(request)
   }
 
   func userContentController(
@@ -475,6 +492,46 @@ private final class MacOSWebViewInstance: NSObject,
     reportError(error, isMainFrame: true)
   }
 
+  /// Links with `target="_blank"` and `window.open(...)` request a new web view.
+  /// Embedded views have no tab strip, so open `http(s)` targets in place
+  /// instead of silently dropping the click.
+  func webView(
+    _ webView: WKWebView,
+    createWebViewWith configuration: WKWebViewConfiguration,
+    for navigationAction: WKNavigationAction,
+    windowFeatures: WKWindowFeatures
+  ) -> WKWebView? {
+    guard !isDisposed,
+          navigationAction.targetFrame == nil,
+          let url = navigationAction.request.url,
+          let scheme = url.scheme?.lowercased(),
+          scheme == "http" || scheme == "https"
+    else {
+      return nil
+    }
+    webView.load(navigationAction.request)
+    return nil
+  }
+
+  /// The WebContent process crashed or was killed by the system (memory
+  /// pressure, sleep/wake). WebKit leaves a blank, input-dead view behind, so
+  /// report it and reload automatically instead of leaving a frozen surface.
+  func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+    guard !isDisposed else { return }
+    plugin?.sendEvent(
+      "onWebResourceError",
+      arguments: [
+        "controllerId": controllerId,
+        "errorCode": -1,
+        "description": "The web content process terminated unexpectedly.",
+        "errorType": "webContentProcessTerminated",
+        "isForMainFrame": true,
+        "url": webView.url?.absoluteString,
+      ]
+    )
+    webView.reload()
+  }
+
   private func reportError(_ error: Error, isMainFrame: Bool) {
     guard !isDisposed else { return }
     let nsError = error as NSError
@@ -482,7 +539,7 @@ private final class MacOSWebViewInstance: NSObject,
       return
     }
     let failingUrl = (nsError.userInfo[NSURLErrorFailingURLStringErrorKey] as? String)
-      ?? webView.url?.absoluteString
+      ?? weakWebView?.url?.absoluteString
     plugin?.sendEvent(
       "onWebResourceError",
       arguments: [
@@ -531,7 +588,7 @@ private final class MacOSWebViewInstance: NSObject,
     registrar: FlutterPluginRegistrar?,
     result: @escaping FlutterResult
   ) {
-    if isDisposed {
+    guard !isDisposed, let webView = weakWebView else {
       result(nil)
       return
     }
@@ -723,6 +780,10 @@ private final class MacOSWebViewInstance: NSObject,
     if let num = value as? NSNumber {
       if CFGetTypeID(num) == CFBooleanGetTypeID() {
         return num.boolValue
+      }
+      let dbl = num.doubleValue
+      if dbl.isFinite, dbl == dbl.rounded(), abs(dbl) <= 9_007_199_254_740_991.0 {
+        return NSNumber(value: Int64(dbl))
       }
       return num
     }

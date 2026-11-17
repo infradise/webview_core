@@ -205,6 +205,7 @@ private final class FallbackEmptyPlatformView: NSObject, FlutterPlatformView {
 private final class IOSWebViewPlatformView: NSObject,
   FlutterPlatformView,
   WKNavigationDelegate,
+  WKUIDelegate,
   WKScriptMessageHandler
 {
   private let controllerId: Int
@@ -238,6 +239,7 @@ private final class IOSWebViewPlatformView: NSObject,
     super.init()
 
     webView.navigationDelegate = self
+    webView.uiDelegate = self
     webView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
     webView.isOpaque = false
 
@@ -324,6 +326,7 @@ private final class IOSWebViewPlatformView: NSObject,
     registeredChannels.removeAll()
     controller.removeAllUserScripts()
     webView.navigationDelegate = nil
+    webView.uiDelegate = nil
     webView.stopLoading()
     plugin?.removeInstance(controllerId: controllerId, instance: self)
   }
@@ -474,6 +477,45 @@ private final class IOSWebViewPlatformView: NSObject,
     withError error: Error
   ) {
     reportError(error, isMainFrame: true)
+  }
+
+  /// Links with `target="_blank"` and `window.open(...)` request a new web view.
+  /// Embedded views have no tab strip, so open `http(s)` targets in place
+  /// instead of silently dropping the tap.
+  func webView(
+    _ webView: WKWebView,
+    createWebViewWith configuration: WKWebViewConfiguration,
+    for navigationAction: WKNavigationAction,
+    windowFeatures: WKWindowFeatures
+  ) -> WKWebView? {
+    guard !isDisposed,
+          navigationAction.targetFrame == nil,
+          let url = navigationAction.request.url,
+          let scheme = url.scheme?.lowercased(),
+          scheme == "http" || scheme == "https"
+    else {
+      return nil
+    }
+    webView.load(navigationAction.request)
+    return nil
+  }
+
+  /// The WebContent process crashed or was killed by the system. Report it and
+  /// reload instead of leaving a blank, input-dead view.
+  func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+    guard !isDisposed else { return }
+    plugin?.sendEvent(
+      "onWebResourceError",
+      arguments: [
+        "controllerId": controllerId,
+        "errorCode": -1,
+        "description": "The web content process terminated unexpectedly.",
+        "errorType": "webContentProcessTerminated",
+        "isForMainFrame": true,
+        "url": webView.url?.absoluteString,
+      ]
+    )
+    webView.reload()
   }
 
   private func reportError(_ error: Error, isMainFrame: Bool) {

@@ -178,6 +178,7 @@ struct LinuxWebViewInstance {
   gulong notify_uri_id = 0;
   gulong notify_progress_id = 0;
   gulong decide_policy_id = 0;
+  gulong create_id = 0;
   gulong webview_destroy_id = 0;
   gulong clip_destroy_id = 0;
   bool destroyed = false;
@@ -224,6 +225,10 @@ struct LinuxWebViewInstance {
         g_signal_handler_disconnect(webview, decide_policy_id);
         decide_policy_id = 0;
       }
+      if (create_id != 0) {
+        g_signal_handler_disconnect(webview, create_id);
+        create_id = 0;
+      }
       if (webview_destroy_id != 0) {
         g_signal_handler_disconnect(webview, webview_destroy_id);
         webview_destroy_id = 0;
@@ -268,6 +273,7 @@ void OnWebViewDestroyed(GtkWidget* /*widget*/, gpointer user_data) {
   inst->notify_uri_id = 0;
   inst->notify_progress_id = 0;
   inst->decide_policy_id = 0;
+  inst->create_id = 0;
   inst->webview_destroy_id = 0;
   inst->webview = nullptr;
 }
@@ -642,6 +648,27 @@ gboolean OnDecidePolicy(WebKitWebView* /*web_view*/,
   return TRUE;
 }
 
+// Links with target="_blank" and window.open() request a new WebKitWebView.
+// Embedded views have no tab strip, so open http(s) targets in place instead of
+// silently dropping the click.
+GtkWidget* OnCreateWebView(WebKitWebView* web_view,
+                           WebKitNavigationAction* navigation_action,
+                           gpointer user_data) {
+  LinuxWebViewInstance* inst = static_cast<LinuxWebViewInstance*>(user_data);
+  if (inst == nullptr || inst->destroyed || navigation_action == nullptr) {
+    return nullptr;
+  }
+  WebKitURIRequest* request =
+      webkit_navigation_action_get_request(navigation_action);
+  const gchar* uri =
+      request != nullptr ? webkit_uri_request_get_uri(request) : nullptr;
+  if (uri != nullptr && (g_str_has_prefix(uri, "http://") ||
+                         g_str_has_prefix(uri, "https://"))) {
+    webkit_web_view_load_uri(web_view, uri);
+  }
+  return nullptr;
+}
+
 void LoadRequestOnWebView(LinuxWebViewInstance* inst,
                           const std::string& url,
                           const std::string& method,
@@ -995,6 +1022,8 @@ LinuxWebViewInstance* CreateInstance(PluginState* state,
       G_CALLBACK(OnNotifyProgress), inst.get());
   inst->decide_policy_id = g_signal_connect(
       inst->webview, "decide-policy", G_CALLBACK(OnDecidePolicy), inst.get());
+  inst->create_id = g_signal_connect(inst->webview, "create",
+                                     G_CALLBACK(OnCreateWebView), inst.get());
   inst->webview_destroy_id = g_signal_connect(
       inst->webview, "destroy", G_CALLBACK(OnWebViewDestroyed), inst.get());
   inst->clip_destroy_id =

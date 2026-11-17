@@ -1,3 +1,20 @@
+## 1.1.0
+
+Runtime stability release. Fixes native views that stopped responding after being hidden and shown again, restores in-page clicks on freshly mounted previews, adds the missing right-click menu on Windows, and ships a real-native integration test suite.
+
+### Fixed
+* **macOS: native `WKWebView` was permanently destroyed when Flutter hid it.** The v1.0.0 teardown that reacted to `viewDidMoveToSuperview` also fired when the Flutter engine temporarily detached the platform view (`IndexedStack`, `Offstage`, collapsing panels, frames without a platform-view layer). The page was stopped, its delegate and script handlers were removed, and every later call (`loadHtmlString`, `evaluateJavaScript`, `reload`, …) silently returned `null`, leaving an unresponsive view that only recovered after the user chose *Reload*. The bridge is now owned by the view (`view → bridge`, `bridge ⇢ view` weak) and is released only when Flutter releases the view or `WebViewController.dispose()` is called.
+* **macOS: `evaluateJavaScript('1+1')` returned `'2.0'`** instead of `'2'`; integral JavaScript numbers are now delivered as integers on every platform.
+* **Windows: no context menu.** Composition hosting never renders the default WebView2 menu. Right-click now shows the Edge menu (Back, Forward, Reload, Copy, …) as a native popup through `ContextMenuRequested`.
+* **Windows: keyboard focus trap.** The WebView host consumed every key. `Tab`, `F1`–`F12`, `Escape`, modifier-only presses, and `Win` combinations now stay with Flutter so focus traversal and application shortcuts keep working.
+* **All desktop and iOS: `target="_blank"` links and `window.open()` were silently dropped** (macOS, iOS, Linux) or handled by an external popup (Windows). `http(s)` targets now open in place.
+
+### Added
+* **macOS / iOS: automatic recovery from a crashed `WebContent` process.** The failure is reported through `NavigationDelegate.onWebResourceError` (`WebResourceErrorType.webContentProcessTerminated`) and the page is reloaded.
+* **Native integration tests** (`example/integration_test/`): hide / show cycles, remounts, rounded-clip resize storms, debounced typing storms, JavaScript channels, navigation prevention, cookies, `target="_blank"`, and the example application itself, executed against the real platform plugin (`flutter test integration_test -d macos`).
+* **Windows host key-policy unit test.**
+* **Redesigned example application** with an HTTP response preview, a Mail composer live preview that proves editor text is never modified by preview theming, and a Diagnostics tab (UI heartbeat, native round-trip probe, stress actions, event log).
+
 ## 1.0.0
 
 Initial stable release of **`webview_core`** — a unified, zero-dependency native WebView plugin for Flutter across **Android**, **iOS**, **Linux**, **macOS**, **Windows**, and **Web / WebAssembly** (`dart2wasm`).

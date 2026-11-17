@@ -663,4 +663,68 @@ void main() {
       debugDefaultTargetPlatformOverride = null;
     },
   );
+
+  testWidgets(
+    'Windows host does not swallow Tab, function keys, modifier-only or Meta combos',
+    (WidgetTester tester) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+
+      final controller = WebViewController();
+      await controller.loadHtmlString('<p>keys</p>');
+
+      await tester.pumpWidget(
+        Directionality(
+          textDirection: TextDirection.ltr,
+          child: SizedBox(
+            width: 200,
+            height: 100,
+            child: WebViewWidget(controller: controller),
+          ),
+        ),
+      );
+      await tester.pump();
+
+      // Give the WebView host keyboard focus.
+      await tester.tap(find.byType(Texture));
+      await tester.pump();
+
+      Iterable<MethodCall> keyCalls() =>
+          recordedCalls.where((MethodCall c) => c.method == 'keyEvent');
+
+      // Letters are forwarded to WebView2 and consumed.
+      recordedCalls.clear();
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyA);
+      await tester.pump();
+      expect(keyCalls(), isNotEmpty);
+
+      // Tab, F-keys, Escape, and modifier-only presses must stay with Flutter.
+      for (final key in <LogicalKeyboardKey>[
+        LogicalKeyboardKey.tab,
+        LogicalKeyboardKey.f5,
+        LogicalKeyboardKey.escape,
+        LogicalKeyboardKey.shiftLeft,
+        LogicalKeyboardKey.controlLeft,
+      ]) {
+        recordedCalls.clear();
+        await tester.sendKeyEvent(key);
+        await tester.pump();
+        expect(
+          keyCalls(),
+          isEmpty,
+          reason: '${key.keyLabel} must pass through',
+        );
+      }
+
+      // Windows-key (Meta) combinations must stay with the application.
+      recordedCalls.clear();
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.metaLeft);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyD);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.metaLeft);
+      await tester.pump();
+      expect(keyCalls(), isEmpty);
+
+      await controller.dispose();
+      debugDefaultTargetPlatformOverride = null;
+    },
+  );
 }

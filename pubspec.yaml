@@ -1,6 +1,6 @@
 name: webview_core
 description: Zero-dependency native WebView plugin for Flutter across Android, iOS, Linux, macOS, Windows, and Web. Replaces webview_flutter and webview_all with Wasm support.
-version: 1.0.0
+version: 1.1.0
 homepage: https://github.com/infradise/webview_core
 repository: https://github.com/infradise/webview_core
 issue_tracker: https://github.com/infradise/webview_core/issues
