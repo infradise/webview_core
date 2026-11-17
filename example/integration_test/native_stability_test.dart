@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
@@ -505,6 +506,91 @@ void main() {
     expect(
       await _guard(c.evaluateJavaScript('document.cookie'), 'cookie2'),
       isNot(contains('wvcore=ok')),
+    );
+    await tester.pumpWidget(const SizedBox.shrink());
+    await c.dispose();
+  });
+
+  testWidgets('K. loadHtmlString baseUrl gives the page its real origin', (
+    tester,
+  ) async {
+    final tab = ValueNotifier<int>(0);
+    final c = await boot(tester, tab, html: _html(8), baseUrl: _kBase);
+    expect(
+      await _guard(c.evaluateJavaScript('window.origin'), 'origin'),
+      'https://webview-core-test.invalid',
+      reason: 'document got an opaque origin instead of the baseUrl origin',
+    );
+    expect(
+      await _guard(
+        c.evaluateJavaScript(
+          '(function(){try{localStorage.setItem("k","v");'
+          'return localStorage.getItem("k")}catch(e){return e.name}})()',
+        ),
+        'localStorage',
+      ),
+      'v',
+      reason: 'localStorage must work for a document with a baseUrl origin',
+    );
+    await tester.pumpWidget(const SizedBox.shrink());
+    await c.dispose();
+  });
+
+  testWidgets('L. right click (context menu) does not stall the native bridge', (
+    tester,
+  ) async {
+    final c = WebViewController();
+    final finished = Completer<void>();
+    await c.setJavaScriptMode(JavaScriptMode.unrestricted);
+    await c.setNavigationDelegate(
+      NavigationDelegate(
+        onPageFinished: (String _) {
+          if (!finished.isCompleted) {
+            finished.complete();
+          }
+        },
+      ),
+    );
+    await c.loadHtmlString(
+      '<!DOCTYPE html><html><body style="margin:0"><div style="height:400px">'
+      'hello<script>window.__cm=0;'
+      'document.addEventListener("contextmenu",function(){window.__cm++});'
+      '</script></div></body></html>',
+      baseUrl: _kBase,
+    );
+    await tester.pumpWidget(
+      Directionality(
+        textDirection: TextDirection.ltr,
+        child: SizedBox.expand(child: WebViewWidget(controller: c)),
+      ),
+    );
+    for (var i = 0; i < 60 && !finished.isCompleted; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+    expect(finished.isCompleted, isTrue, reason: 'initial page never finished');
+    await settle(tester, ms: 1000);
+
+    final center = tester.getCenter(find.byType(WebViewWidget));
+    final gesture = await tester.startGesture(
+      center,
+      kind: PointerDeviceKind.mouse,
+      buttons: kSecondaryMouseButton,
+    );
+    await tester.pump(const Duration(milliseconds: 50));
+    await gesture.up();
+    await settle(tester, ms: 1500);
+
+    // A context menu shown synchronously inside the WebView2 event handler
+    // blocks every later native call until the menu is closed.
+    expect(
+      await _guard(c.evaluateJavaScript('1+1'), 'eval after right click'),
+      '2',
+      reason: 'native bridge stalled after a right click',
+    );
+    expect(
+      await _guard(c.evaluateJavaScript('String(window.__cm)'), 'cm count'),
+      '1',
+      reason: 'right click never reached the page',
     );
     await tester.pumpWidget(const SizedBox.shrink());
     await c.dispose();
