@@ -348,16 +348,115 @@ std::wstring ResolveWritableUserDataFolder() {
   return app_dir;
 }
 
+constexpr UINT kWmDrainUiTasks = WM_APP + 0x57;
+constexpr const wchar_t kUiTaskWindowClassName[] =
+    L"WebviewCoreUiTaskRunner";
+
+struct UiTaskQueue {
+  std::mutex mutex;
+  std::vector<std::function<void()>> tasks;
+  HWND hwnd = nullptr;
+  bool closed = false;
+};
+
+LRESULT CALLBACK UiTaskRunnerWndProc(HWND hwnd,
+                                     UINT msg,
+                                     WPARAM wp,
+                                     LPARAM lp) {
+  if (msg == WM_NCCREATE) {
+    const auto* cs = reinterpret_cast<const CREATESTRUCTW*>(lp);
+    if (cs != nullptr && cs->lpCreateParams != nullptr) {
+      ::SetWindowLongPtrW(hwnd, GWLP_USERDATA,
+                          reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
+    }
+    return TRUE;
+  }
+  if (msg == kWmDrainUiTasks) {
+    auto* queue = reinterpret_cast<UiTaskQueue*>(
+        ::GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (queue != nullptr) {
+      std::vector<std::function<void()>> pending;
+      {
+        std::lock_guard<std::mutex> lock(queue->mutex);
+        if (!queue->closed) {
+          pending.swap(queue->tasks);
+        }
+      }
+      for (auto& task : pending) {
+        if (task) {
+          task();
+        }
+      }
+    }
+    return 0;
+  }
+  if (msg == WM_NCDESTROY) {
+    ::SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+    return 0;
+  }
+  return ::DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+HWND CreateUiTaskRunnerWindow(UiTaskQueue* queue) {
+  if (queue == nullptr) {
+    return nullptr;
+  }
+  static bool registered = false;
+  const HINSTANCE instance = ::GetModuleHandleW(nullptr);
+  if (!registered) {
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = UiTaskRunnerWndProc;
+    wc.hInstance = instance;
+    wc.lpszClassName = kUiTaskWindowClassName;
+    if (::RegisterClassExW(&wc) != 0 ||
+        ::GetLastError() == ERROR_CLASS_ALREADY_EXISTS) {
+      registered = true;
+    }
+  }
+  if (!registered) {
+    return nullptr;
+  }
+  return ::CreateWindowExW(0, kUiTaskWindowClassName, L"", 0, 0, 0, 0, 0,
+                           HWND_MESSAGE, nullptr, instance, queue);
+}
+
 class CompositionGraphicsRuntime {
  public:
+  ~CompositionGraphicsRuntime() {
+    HWND hwnd_to_destroy = nullptr;
+    if (task_queue_) {
+      std::lock_guard<std::mutex> lock(task_queue_->mutex);
+      task_queue_->closed = true;
+      task_queue_->tasks.clear();
+      hwnd_to_destroy = task_queue_->hwnd;
+      task_queue_->hwnd = nullptr;
+    }
+    if (hwnd_to_destroy != nullptr && ::IsWindow(hwnd_to_destroy)) {
+      ::SetWindowLongPtrW(hwnd_to_destroy, GWLP_USERDATA, 0);
+      ::DestroyWindow(hwnd_to_destroy);
+    }
+  }
+
   bool EnsureInitialized() {
     if (initialized_) {
       return valid_;
     }
     initialized_ = true;
 
+    if (task_queue_ && task_queue_->hwnd == nullptr) {
+      task_queue_->hwnd = CreateUiTaskRunnerWindow(task_queue_.get());
+    }
+    if (!task_queue_ || task_queue_->hwnd == nullptr) {
+      return false;
+    }
+
     RoInitialize(RO_INIT_SINGLETHREADED);
 
+    // Ensure a thread DispatcherQueue exists for Windows.UI.Composition.
+    // When another plugin (e.g. window_manager / cnativeapi) already created
+    // one on the UI thread, CreateDispatcherQueueController returns an error
+    // and Compositor activation uses the existing thread DispatcherQueue.
     HMODULE core_messaging = LoadLibraryW(L"CoreMessaging.dll");
     if (core_messaging != nullptr) {
       auto create_dq = reinterpret_cast<CreateDispatcherQueueControllerFn>(
@@ -468,27 +567,31 @@ class CompositionGraphicsRuntime {
   }
 
   // Runs `fn` on the thread that initialized the runtime (the Flutter platform
-  // thread) from a later message-loop turn. Returns false if it was not queued.
+  // thread) from a later Win32 message-loop turn via a message-only HWND, so
+  // deferral dispatch works even when another plugin already owns the thread's
+  // WinRT DispatcherQueue.
   bool PostToUiThread(std::function<void()> fn) {
-    if (!dispatcher_queue_controller_) {
+    if (!fn || !task_queue_) {
       return false;
     }
-    ComPtr<ABI::Windows::System::IDispatcherQueue> queue;
-    if (FAILED(dispatcher_queue_controller_->get_DispatcherQueue(&queue)) ||
-        !queue) {
-      return false;
+    HWND hwnd = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(task_queue_->mutex);
+      if (task_queue_->closed || task_queue_->hwnd == nullptr ||
+          !::IsWindow(task_queue_->hwnd)) {
+        return false;
+      }
+      hwnd = task_queue_->hwnd;
+      task_queue_->tasks.push_back(std::move(fn));
     }
-    auto task = std::make_shared<std::function<void()>>(std::move(fn));
-    boolean queued = FALSE;
-    const HRESULT hr = queue->TryEnqueue(
-        Callback<ABI::Windows::System::IDispatcherQueueHandler>(
-            [task]() -> HRESULT {
-              (*task)();
-              return S_OK;
-            })
-            .Get(),
-        &queued);
-    return SUCCEEDED(hr) && queued != FALSE;
+    if (::PostMessageW(hwnd, kWmDrainUiTasks, 0, 0) != FALSE) {
+      return true;
+    }
+    std::lock_guard<std::mutex> lock(task_queue_->mutex);
+    if (!task_queue_->tasks.empty()) {
+      task_queue_->tasks.pop_back();
+    }
+    return false;
   }
 
   bool supports_dxgi_shared() const { return supports_dxgi_shared_; }
@@ -506,6 +609,7 @@ class CompositionGraphicsRuntime {
   bool initialized_ = false;
   bool valid_ = false;
   bool supports_dxgi_shared_ = false;
+  std::shared_ptr<UiTaskQueue> task_queue_ = std::make_shared<UiTaskQueue>();
   ComPtr<ABI::Windows::System::IDispatcherQueueController>
       dispatcher_queue_controller_;
   ComPtr<ABI::Windows::UI::Composition::ICompositor> compositor_;
@@ -517,9 +621,10 @@ class CompositionGraphicsRuntime {
 
 // Builds a Win32 popup menu mirroring the WebView2 context menu model.
 //
-// In visual (composition) hosting WebView2 never displays its own context menu,
-// so the host must render the menu items it receives from
-// `ContextMenuRequested` and report the chosen command back to the engine.
+// Because the composition host HWND lives off-client at (-32000, -32000),
+// letting WebView2 open its built-in popup would clamp the menu to monitor
+// (0, 0). Instead, the host renders the menu items at the real screen cursor
+// position and reports the chosen command back to WebView2.
 void AppendContextMenuItems(HMENU menu,
                             ICoreWebView2ContextMenuItemCollection* items,
                             std::map<UINT, INT32>* command_ids,
@@ -923,7 +1028,9 @@ class WindowsWebViewInstance
   HRESULT HandleContextMenuRequested(
       ICoreWebView2ContextMenuRequestedEventArgs* args);
   void ShowContextMenu(ICoreWebView2ContextMenuRequestedEventArgs* args,
-                       ICoreWebView2ContextMenuItemCollection* items);
+                       ICoreWebView2ContextMenuItemCollection* items,
+                       POINT screen_pt);
+  void CancelActiveContextMenu();
   void RebuildChannelScript();
   void LoadHtmlInternal(const std::string& html, const std::string& base_url);
   void LoadRequestInternal(const std::string& url,
@@ -1016,6 +1123,9 @@ class WindowsWebViewInstance
   std::wstring custom_user_agent_;
   std::set<std::string> channel_names_;
   std::vector<PendingOp> pending_ops_;
+  POINT last_context_screen_pt_{};
+  bool has_last_context_screen_pt_ = false;
+  bool showing_context_menu_ = false;
   bool ready_ = false;
   bool disposed_ = false;
 };
@@ -2062,6 +2172,7 @@ void WindowsWebViewInstance::Dispose() {
     return;
   }
   disposed_ = true;
+  CancelActiveContextMenu();
   CancelPendingOps();
 
   if (webview_) {
@@ -2290,6 +2401,9 @@ void WindowsWebViewInstance::SetSizeInternal(int width,
 
 void WindowsWebViewInstance::SetVisibilityInternal(bool visible) {
   visible_ = visible;
+  if (!visible) {
+    CancelActiveContextMenu();
+  }
   if (root_visual_) {
     root_visual_->put_IsVisible(visible ? TRUE : FALSE);
   }
@@ -2414,18 +2528,50 @@ void WindowsWebViewInstance::LoadRequestInternal(
   webview_->Navigate(wurl.c_str());
 }
 
+void WindowsWebViewInstance::CancelActiveContextMenu() {
+  if (!showing_context_menu_) {
+    return;
+  }
+  ::EndMenu();
+  const HWND menu_owner =
+      (top_hwnd_ != nullptr && ::IsWindow(top_hwnd_)) ? top_hwnd_
+                                                      : parent_hwnd_;
+  if (menu_owner != nullptr && ::IsWindow(menu_owner)) {
+    ::SendMessageW(menu_owner, WM_CANCELMODE, 0, 0);
+  }
+}
+
 HRESULT WindowsWebViewInstance::HandleContextMenuRequested(
     ICoreWebView2ContextMenuRequestedEventArgs* args) {
-  if (args == nullptr || disposed_ || parent_hwnd_ == nullptr) {
+  if (args == nullptr) {
+    return S_OK;
+  }
+  if (disposed_ || !visible_ || parent_hwnd_ == nullptr) {
+    args->put_Handled(TRUE);
     return S_OK;
   }
   ComPtr<ICoreWebView2ContextMenuItemCollection> items;
   if (FAILED(args->get_MenuItems(&items)) || !items) {
+    args->put_Handled(TRUE);
     return S_OK;
   }
   UINT32 count = 0;
   if (FAILED(items->get_Count(&count)) || count == 0) {
+    args->put_Handled(TRUE);
     return S_OK;
+  }
+
+  POINT menu_pt{};
+  if (::GetCursorPos(&menu_pt) == FALSE) {
+    if (has_last_context_screen_pt_) {
+      menu_pt = last_context_screen_pt_;
+    } else if (::IsWindow(parent_hwnd_)) {
+      RECT rc{};
+      if (::GetWindowRect(parent_hwnd_, &rc) != FALSE) {
+        menu_pt.x = rc.left + (rc.right - rc.left) / 2;
+        menu_pt.y = rc.top + (rc.bottom - rc.top) / 2;
+      }
+    }
   }
 
   // `TrackPopupMenu` runs a modal message loop. Doing that inside the event
@@ -2434,20 +2580,26 @@ HRESULT WindowsWebViewInstance::HandleContextMenuRequested(
   // show the menu from a later message-loop turn instead.
   ComPtr<ICoreWebView2Deferral> deferral;
   if (FAILED(args->GetDeferral(&deferral)) || !deferral) {
+    args->put_Handled(TRUE);
     return S_OK;
   }
   ComPtr<ICoreWebView2ContextMenuRequestedEventArgs> args_ref(args);
   std::weak_ptr<WindowsWebViewInstance> weak_self = shared_from_this();
   const bool queued = gfx_ != nullptr && gfx_->PostToUiThread(
-      [weak_self, args_ref, items, deferral]() {
+      [weak_self, args_ref, items, deferral, menu_pt]() {
         if (auto inst = weak_self.lock()) {
-          if (!inst->disposed_) {
-            inst->ShowContextMenu(args_ref.Get(), items.Get());
+          if (!inst->disposed_ && inst->visible_) {
+            inst->ShowContextMenu(args_ref.Get(), items.Get(), menu_pt);
+          } else {
+            args_ref->put_Handled(TRUE);
           }
+        } else {
+          args_ref->put_Handled(TRUE);
         }
         deferral->Complete();
       });
   if (!queued) {
+    args->put_Handled(TRUE);
     deferral->Complete();
   }
   return S_OK;
@@ -2455,12 +2607,21 @@ HRESULT WindowsWebViewInstance::HandleContextMenuRequested(
 
 void WindowsWebViewInstance::ShowContextMenu(
     ICoreWebView2ContextMenuRequestedEventArgs* args,
-    ICoreWebView2ContextMenuItemCollection* items) {
+    ICoreWebView2ContextMenuItemCollection* items,
+    POINT screen_pt) {
+  if (args == nullptr) {
+    return;
+  }
+  // Always mark handled so WebView2 never falls back to anchoring its own menu
+  // against the off-client (-32000, -32000) composition host HWND (which
+  // Windows clamps to monitor (0, 0)).
+  args->put_Handled(TRUE);
+
   const HWND menu_owner =
       (top_hwnd_ != nullptr && ::IsWindow(top_hwnd_)) ? top_hwnd_
                                                       : parent_hwnd_;
-  if (args == nullptr || items == nullptr || menu_owner == nullptr ||
-      !::IsWindow(menu_owner)) {
+  if (items == nullptr || menu_owner == nullptr || !::IsWindow(menu_owner) ||
+      !::IsWindowVisible(menu_owner) || ::IsIconic(menu_owner)) {
     return;
   }
   HMENU menu = CreatePopupMenu();
@@ -2473,25 +2634,24 @@ void WindowsWebViewInstance::ShowContextMenu(
   TrimTrailingMenuSeparator(menu);
 
   if (GetMenuItemCount(menu) > 0) {
-    POINT cursor{};
-    GetCursorPos(&cursor);
+    showing_context_menu_ = true;
     SetForegroundWindow(menu_owner);
     const UINT picked = static_cast<UINT>(TrackPopupMenu(
         menu,
         TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN |
             TPM_RIGHTBUTTON,
-        cursor.x, cursor.y, 0, menu_owner, nullptr));
+        screen_pt.x, screen_pt.y, 0, menu_owner, nullptr));
+    showing_context_menu_ = false;
     ::PostMessageW(menu_owner, WM_NULL, 0, 0);
-    if (picked != 0) {
+    if (picked != 0 && !disposed_) {
       const auto found = command_ids.find(picked);
       if (found != command_ids.end()) {
         args->put_SelectedCommandId(found->second);
       }
     }
-    args->put_Handled(TRUE);
-    if (parent_hwnd_ != nullptr && parent_hwnd_ != ::GetDesktopWindow() &&
-        ::IsWindow(parent_hwnd_) && ::GetActiveWindow() == menu_owner &&
-        ::GetFocus() != parent_hwnd_) {
+    if (!disposed_ && parent_hwnd_ != nullptr &&
+        parent_hwnd_ != ::GetDesktopWindow() && ::IsWindow(parent_hwnd_) &&
+        ::GetActiveWindow() == menu_owner && ::GetFocus() != parent_hwnd_) {
       ::SetFocus(parent_hwnd_);
     }
   }
@@ -2508,6 +2668,14 @@ void WindowsWebViewInstance::HandlePointerEvent(
   int64_t buttons = 0;
   GetIntArg(args, "button", &button);
   GetIntArg(args, "buttons", &buttons);
+  if ((kind == "down" || kind == "up") &&
+      (button == 2 || (buttons & 2) != 0)) {
+    POINT cur{};
+    if (::GetCursorPos(&cur) != FALSE) {
+      last_context_screen_pt_ = cur;
+      has_last_context_screen_pt_ = true;
+    }
+  }
   const double x = GetDoubleArg(args, "x", 0.0);
   const double y = GetDoubleArg(args, "y", 0.0);
   const double dx = GetDoubleArg(args, "deltaX", 0.0);
