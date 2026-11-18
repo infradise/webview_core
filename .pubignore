@@ -13,6 +13,7 @@ example/macos/
 example/web/
 example/windows/
 example/test/
+example/integration_test/
 example/build/
 example/.dart_tool/
 example/pubspec.lock

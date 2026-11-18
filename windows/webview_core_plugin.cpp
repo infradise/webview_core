@@ -7,6 +7,7 @@
 #include <flutter/texture_registrar.h>
 
 #include <windows.h>
+#include <commctrl.h>
 #include <d3d11.h>
 #include <dxgi.h>
 #include <roapi.h>
@@ -24,6 +25,7 @@
 #include <wrl/event.h>
 #pragma warning(pop)
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -346,16 +348,115 @@ std::wstring ResolveWritableUserDataFolder() {
   return app_dir;
 }
 
+constexpr UINT kWmDrainUiTasks = WM_APP + 0x57;
+constexpr const wchar_t kUiTaskWindowClassName[] =
+    L"WebviewCoreUiTaskRunner";
+
+struct UiTaskQueue {
+  std::mutex mutex;
+  std::vector<std::function<void()>> tasks;
+  HWND hwnd = nullptr;
+  bool closed = false;
+};
+
+LRESULT CALLBACK UiTaskRunnerWndProc(HWND hwnd,
+                                     UINT msg,
+                                     WPARAM wp,
+                                     LPARAM lp) {
+  if (msg == WM_NCCREATE) {
+    const auto* cs = reinterpret_cast<const CREATESTRUCTW*>(lp);
+    if (cs != nullptr && cs->lpCreateParams != nullptr) {
+      ::SetWindowLongPtrW(hwnd, GWLP_USERDATA,
+                          reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
+    }
+    return TRUE;
+  }
+  if (msg == kWmDrainUiTasks) {
+    auto* queue = reinterpret_cast<UiTaskQueue*>(
+        ::GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (queue != nullptr) {
+      std::vector<std::function<void()>> pending;
+      {
+        std::lock_guard<std::mutex> lock(queue->mutex);
+        if (!queue->closed) {
+          pending.swap(queue->tasks);
+        }
+      }
+      for (auto& task : pending) {
+        if (task) {
+          task();
+        }
+      }
+    }
+    return 0;
+  }
+  if (msg == WM_NCDESTROY) {
+    ::SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+    return 0;
+  }
+  return ::DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+HWND CreateUiTaskRunnerWindow(UiTaskQueue* queue) {
+  if (queue == nullptr) {
+    return nullptr;
+  }
+  static bool registered = false;
+  const HINSTANCE instance = ::GetModuleHandleW(nullptr);
+  if (!registered) {
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = UiTaskRunnerWndProc;
+    wc.hInstance = instance;
+    wc.lpszClassName = kUiTaskWindowClassName;
+    if (::RegisterClassExW(&wc) != 0 ||
+        ::GetLastError() == ERROR_CLASS_ALREADY_EXISTS) {
+      registered = true;
+    }
+  }
+  if (!registered) {
+    return nullptr;
+  }
+  return ::CreateWindowExW(0, kUiTaskWindowClassName, L"", 0, 0, 0, 0, 0,
+                           HWND_MESSAGE, nullptr, instance, queue);
+}
+
 class CompositionGraphicsRuntime {
  public:
+  ~CompositionGraphicsRuntime() {
+    HWND hwnd_to_destroy = nullptr;
+    if (task_queue_) {
+      std::lock_guard<std::mutex> lock(task_queue_->mutex);
+      task_queue_->closed = true;
+      task_queue_->tasks.clear();
+      hwnd_to_destroy = task_queue_->hwnd;
+      task_queue_->hwnd = nullptr;
+    }
+    if (hwnd_to_destroy != nullptr && ::IsWindow(hwnd_to_destroy)) {
+      ::SetWindowLongPtrW(hwnd_to_destroy, GWLP_USERDATA, 0);
+      ::DestroyWindow(hwnd_to_destroy);
+    }
+  }
+
   bool EnsureInitialized() {
     if (initialized_) {
       return valid_;
     }
     initialized_ = true;
 
+    if (task_queue_ && task_queue_->hwnd == nullptr) {
+      task_queue_->hwnd = CreateUiTaskRunnerWindow(task_queue_.get());
+    }
+    if (!task_queue_ || task_queue_->hwnd == nullptr) {
+      return false;
+    }
+
     RoInitialize(RO_INIT_SINGLETHREADED);
 
+    // Ensure a thread DispatcherQueue exists for Windows.UI.Composition.
+    // When another plugin (e.g. window_manager / cnativeapi) already created
+    // one on the UI thread, CreateDispatcherQueueController returns an error
+    // and Compositor activation uses the existing thread DispatcherQueue.
     HMODULE core_messaging = LoadLibraryW(L"CoreMessaging.dll");
     if (core_messaging != nullptr) {
       auto create_dq = reinterpret_cast<CreateDispatcherQueueControllerFn>(
@@ -465,6 +566,34 @@ class CompositionGraphicsRuntime {
     return true;
   }
 
+  // Runs `fn` on the thread that initialized the runtime (the Flutter platform
+  // thread) from a later Win32 message-loop turn via a message-only HWND, so
+  // deferral dispatch works even when another plugin already owns the thread's
+  // WinRT DispatcherQueue.
+  bool PostToUiThread(std::function<void()> fn) {
+    if (!fn || !task_queue_) {
+      return false;
+    }
+    HWND hwnd = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(task_queue_->mutex);
+      if (task_queue_->closed || task_queue_->hwnd == nullptr ||
+          !::IsWindow(task_queue_->hwnd)) {
+        return false;
+      }
+      hwnd = task_queue_->hwnd;
+      task_queue_->tasks.push_back(std::move(fn));
+    }
+    if (::PostMessageW(hwnd, kWmDrainUiTasks, 0, 0) != FALSE) {
+      return true;
+    }
+    std::lock_guard<std::mutex> lock(task_queue_->mutex);
+    if (!task_queue_->tasks.empty()) {
+      task_queue_->tasks.pop_back();
+    }
+    return false;
+  }
+
   bool supports_dxgi_shared() const { return supports_dxgi_shared_; }
   ABI::Windows::UI::Composition::ICompositor* compositor() const {
     return compositor_.Get();
@@ -480,6 +609,7 @@ class CompositionGraphicsRuntime {
   bool initialized_ = false;
   bool valid_ = false;
   bool supports_dxgi_shared_ = false;
+  std::shared_ptr<UiTaskQueue> task_queue_ = std::make_shared<UiTaskQueue>();
   ComPtr<ABI::Windows::System::IDispatcherQueueController>
       dispatcher_queue_controller_;
   ComPtr<ABI::Windows::UI::Composition::ICompositor> compositor_;
@@ -489,12 +619,336 @@ class CompositionGraphicsRuntime {
       winrt_d3d_device_;
 };
 
+// Builds a Win32 popup menu mirroring the WebView2 context menu model.
+//
+// Because the composition host HWND lives off-client at (-32000, -32000),
+// letting WebView2 open its built-in popup would clamp the menu to monitor
+// (0, 0). Instead, the host renders the menu items at the real screen cursor
+// position and reports the chosen command back to WebView2.
+void AppendContextMenuItems(HMENU menu,
+                            ICoreWebView2ContextMenuItemCollection* items,
+                            std::map<UINT, INT32>* command_ids,
+                            UINT* next_id) {
+  if (menu == nullptr || items == nullptr || command_ids == nullptr ||
+      next_id == nullptr) {
+    return;
+  }
+  UINT32 count = 0;
+  if (FAILED(items->get_Count(&count))) {
+    return;
+  }
+  bool last_was_separator = true;
+  for (UINT32 i = 0; i < count; ++i) {
+    ComPtr<ICoreWebView2ContextMenuItem> item;
+    if (FAILED(items->GetValueAtIndex(i, &item)) || !item) {
+      continue;
+    }
+    COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND kind =
+        COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_COMMAND;
+    item->get_Kind(&kind);
+    if (kind == COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_SEPARATOR) {
+      if (!last_was_separator) {
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        last_was_separator = true;
+      }
+      continue;
+    }
+
+    std::wstring label;
+    LPWSTR label_raw = nullptr;
+    if (SUCCEEDED(item->get_Label(&label_raw)) && label_raw != nullptr) {
+      label = label_raw;
+      CoTaskMemFree(label_raw);
+    }
+    LPWSTR shortcut_raw = nullptr;
+    if (SUCCEEDED(item->get_ShortcutKeyDescription(&shortcut_raw)) &&
+        shortcut_raw != nullptr) {
+      if (shortcut_raw[0] != L'\0') {
+        label += L"\t";
+        label += shortcut_raw;
+      }
+      CoTaskMemFree(shortcut_raw);
+    }
+
+    BOOL enabled = TRUE;
+    item->get_IsEnabled(&enabled);
+    UINT flags = MF_STRING | (enabled ? MF_ENABLED : MF_GRAYED);
+
+    if (kind == COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_SUBMENU) {
+      ComPtr<ICoreWebView2ContextMenuItemCollection> children;
+      if (SUCCEEDED(item->get_Children(&children)) && children) {
+        HMENU submenu = CreatePopupMenu();
+        if (submenu != nullptr) {
+          AppendContextMenuItems(submenu, children.Get(), command_ids,
+                                 next_id);
+          AppendMenuW(menu, flags | MF_POPUP,
+                      reinterpret_cast<UINT_PTR>(submenu), label.c_str());
+          last_was_separator = false;
+        }
+      }
+      continue;
+    }
+
+    if (kind == COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_CHECK_BOX ||
+        kind == COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_RADIO) {
+      BOOL checked = FALSE;
+      item->get_IsChecked(&checked);
+      if (checked) {
+        flags |= MF_CHECKED;
+      }
+    }
+
+    INT32 command_id = 0;
+    item->get_CommandId(&command_id);
+    const UINT menu_id = (*next_id)++;
+    (*command_ids)[menu_id] = command_id;
+    AppendMenuW(menu, flags, menu_id, label.c_str());
+    last_was_separator = false;
+  }
+}
+
+void TrimTrailingMenuSeparator(HMENU menu) {
+  const int count = GetMenuItemCount(menu);
+  if (count <= 0) {
+    return;
+  }
+  MENUITEMINFOW info{};
+  info.cbSize = sizeof(info);
+  info.fMask = MIIM_FTYPE;
+  if (GetMenuItemInfoW(menu, static_cast<UINT>(count - 1), TRUE, &info) &&
+      (info.fType & MFT_SEPARATOR) != 0) {
+    DeleteMenu(menu, static_cast<UINT>(count - 1), MF_BYPOSITION);
+  }
+}
+
+constexpr const wchar_t kCompositionHostClassName[] =
+    L"WebviewCoreCompositionHost";
+constexpr const wchar_t kInternalWebViewHwndProp[] =
+    L"WebviewCoreInternalHwnd";
+constexpr const wchar_t kHostFlutterViewProp[] =
+    L"WebviewCoreFlutterViewHwnd";
+constexpr UINT_PTR kFlutterViewGuardSubclassId = 0x57564331u;
+
+bool IsInternalWebViewWindow(HWND candidate) {
+  HWND cur = candidate;
+  for (int depth = 0; depth < 8 && cur != nullptr; ++depth) {
+    if (::GetPropW(cur, kInternalWebViewHwndProp) != nullptr) {
+      return true;
+    }
+    cur = ::GetParent(cur);
+  }
+  return false;
+}
+
+bool IsAnyMouseButtonPressed() {
+  return (::GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0 ||
+         (::GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0 ||
+         (::GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0;
+}
+
+// Shields Flutter's view HWND (`FLUTTERVIEW`) from losing Win32 keyboard focus
+// or mouse capture to WebView2's internal `Chrome_WidgetWin_*` child HWND.
+//
+// In composition hosting all pointer and keyboard input flows through Flutter
+// (`Listener` / `Focus`) -> MethodChannel -> `SendMouseInput` / `ExecuteScript`.
+// If WebView2 steals `GetCapture()` during a mouse press, `FLUTTERVIEW` misses
+// `WM_LBUTTONUP` and WebView2 never receives `SendMouseInput(UP)`, wedging
+// pointer input across the entire host window until the WebView is hidden.
+LRESULT CALLBACK FlutterViewInputGuardSubclass(HWND hwnd,
+                                               UINT msg,
+                                               WPARAM wp,
+                                               LPARAM lp,
+                                               UINT_PTR subclass_id,
+                                               DWORD_PTR /*ref_data*/) {
+  if (msg == WM_NCDESTROY) {
+    ::RemoveWindowSubclass(hwnd, FlutterViewInputGuardSubclass, subclass_id);
+    return ::DefSubclassProc(hwnd, msg, wp, lp);
+  }
+  if (msg == WM_KILLFOCUS) {
+    const HWND next = reinterpret_cast<HWND>(wp);
+    if (IsInternalWebViewWindow(next)) {
+      static thread_local bool restoring_focus = false;
+      if (!restoring_focus) {
+        restoring_focus = true;
+        ::SetFocus(hwnd);
+        restoring_focus = false;
+      }
+      return 0;
+    }
+  }
+  if (msg == WM_CAPTURECHANGED) {
+    const HWND next = reinterpret_cast<HWND>(lp);
+    if (IsInternalWebViewWindow(next)) {
+      static thread_local bool restoring_capture = false;
+      if (!restoring_capture) {
+        restoring_capture = true;
+        if (IsAnyMouseButtonPressed()) {
+          ::SetCapture(hwnd);
+        } else {
+          ::ReleaseCapture();
+        }
+        restoring_capture = false;
+      }
+      return 0;
+    }
+  }
+  return ::DefSubclassProc(hwnd, msg, wp, lp);
+}
+
+void EnsureFlutterViewGuarded(HWND flutter_hwnd) {
+  if (flutter_hwnd == nullptr || !::IsWindow(flutter_hwnd) ||
+      flutter_hwnd == ::GetDesktopWindow()) {
+    return;
+  }
+  DWORD_PTR existing = 0;
+  if (!::GetWindowSubclass(flutter_hwnd, FlutterViewInputGuardSubclass,
+                           kFlutterViewGuardSubclassId, &existing)) {
+    ::SetWindowSubclass(flutter_hwnd, FlutterViewInputGuardSubclass,
+                        kFlutterViewGuardSubclassId, 0);
+  }
+}
+
+LRESULT CALLBACK CompositionHostWndProc(HWND hwnd,
+                                        UINT msg,
+                                        WPARAM wp,
+                                        LPARAM lp) {
+  switch (msg) {
+    case WM_NCHITTEST:
+      return HTTRANSPARENT;
+    case WM_MOUSEACTIVATE:
+      return MA_NOACTIVATE;
+    case WM_PARENTNOTIFY:
+      if (LOWORD(wp) == WM_CREATE) {
+        const HWND child = reinterpret_cast<HWND>(lp);
+        if (child != nullptr && ::IsWindow(child)) {
+          ::SetPropW(child, kInternalWebViewHwndProp,
+                     reinterpret_cast<HANDLE>(1));
+        }
+      }
+      break;
+    case WM_SETFOCUS: {
+      const HWND flutter_view =
+          static_cast<HWND>(::GetPropW(hwnd, kHostFlutterViewProp));
+      if (flutter_view != nullptr && ::IsWindow(flutter_view) &&
+          flutter_view != hwnd) {
+        ::SetFocus(flutter_view);
+        return 0;
+      }
+      break;
+    }
+    case WM_NCDESTROY:
+      ::RemovePropW(hwnd, kInternalWebViewHwndProp);
+      ::RemovePropW(hwnd, kHostFlutterViewProp);
+      break;
+    default:
+      break;
+  }
+  return ::DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+HWND CreateCompositionHostWindow(HWND top_hwnd, HWND flutter_hwnd) {
+  static bool class_registered = false;
+  const HINSTANCE instance = ::GetModuleHandleW(nullptr);
+  if (!class_registered) {
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = CompositionHostWndProc;
+    wc.hInstance = instance;
+    wc.lpszClassName = kCompositionHostClassName;
+    if (::RegisterClassExW(&wc) != 0 ||
+        ::GetLastError() == ERROR_CLASS_ALREADY_EXISTS) {
+      class_registered = true;
+    }
+  }
+  if (!class_registered) {
+    return nullptr;
+  }
+  const HWND parent = (top_hwnd != nullptr && ::IsWindow(top_hwnd) &&
+                       top_hwnd != ::GetDesktopWindow())
+                          ? top_hwnd
+                          : flutter_hwnd;
+  const DWORD style = (parent != nullptr && parent != ::GetDesktopWindow())
+                          ? (WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS)
+                          : WS_POPUP;
+  const DWORD ex_style =
+      WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_NOPARENTNOTIFY;
+  const HWND host = ::CreateWindowExW(
+      ex_style, kCompositionHostClassName, L"", style, -32000, -32000, 1, 1,
+      parent, nullptr, instance, nullptr);
+  if (host != nullptr) {
+    ::SetPropW(host, kInternalWebViewHwndProp, reinterpret_cast<HANDLE>(1));
+    if (flutter_hwnd != nullptr && flutter_hwnd != ::GetDesktopWindow()) {
+      ::SetPropW(host, kHostFlutterViewProp, flutter_hwnd);
+    }
+  }
+  return host;
+}
+
 class WebviewCorePlugin;
+
+// Result sink for plugin-internal calls that have no Dart caller waiting.
+class DiscardingMethodResult
+    : public flutter::MethodResult<flutter::EncodableValue> {
+ protected:
+  void SuccessInternal(const flutter::EncodableValue* /*result*/) override {}
+  void ErrorInternal(const std::string& /*error_code*/,
+                     const std::string& /*error_message*/,
+                     const flutter::EncodableValue* /*error_details*/)
+      override {}
+  void NotImplementedInternal() override {}
+};
 
 struct PendingOp {
   std::function<void()> execute;
   std::function<void()> cancel;
 };
+
+// Frame data read by the Flutter raster thread through the texture callbacks.
+//
+// It is reference counted and captured by those callbacks (instead of a raw
+// `this`) so it can never dangle: the engine may still invoke a texture
+// callback, and read the returned descriptor, after the owning view was
+// disposed and destroyed (the engine unregisters textures asynchronously).
+struct TextureFrameState {
+  TextureFrameState() {
+    gpu_surface.struct_size = sizeof(FlutterDesktopGpuSurfaceDescriptor);
+    gpu_surface.handle = nullptr;
+    gpu_surface.width = 0;
+    gpu_surface.height = 0;
+    gpu_surface.visible_width = 0;
+    gpu_surface.visible_height = 0;
+    gpu_surface.format = kFlutterDesktopPixelFormatBGRA8888;
+    gpu_surface.release_callback = nullptr;
+    gpu_surface.release_context = nullptr;
+
+    pixel_buffer.buffer = nullptr;
+    pixel_buffer.width = 0;
+    pixel_buffer.height = 0;
+    pixel_buffer.release_context = nullptr;
+    pixel_buffer.release_callback = nullptr;
+  }
+
+  std::mutex mutex;
+  HANDLE front_gpu_handle = nullptr;
+  size_t gpu_width = 0;
+  size_t gpu_height = 0;
+  FlutterDesktopGpuSurfaceDescriptor gpu_surface{};
+
+  std::vector<uint8_t> rgba_front;
+  size_t front_width = 0;
+  size_t front_height = 0;
+  FlutterDesktopPixelBuffer pixel_buffer{};
+};
+
+// Shared D3D textures replaced by a resize. The engine imports them by legacy
+// shared handle on its own thread/device, so they must outlive the last frame
+// that referenced them.
+struct RetiredSharedTextures {
+  ComPtr<ID3D11Texture2D> textures[2];
+  ULONGLONG retired_at_ms = 0;
+};
+
+constexpr ULONGLONG kRetiredTextureLifetimeMs = 3000;
 
 class WindowsWebViewInstance
     : public std::enable_shared_from_this<WindowsWebViewInstance> {
@@ -507,21 +961,6 @@ class WindowsWebViewInstance
         plugin_(plugin),
         texture_registrar_(texture_registrar),
         gfx_(gfx) {
-    gpu_surface_.struct_size = sizeof(FlutterDesktopGpuSurfaceDescriptor);
-    gpu_surface_.handle = nullptr;
-    gpu_surface_.width = 0;
-    gpu_surface_.height = 0;
-    gpu_surface_.visible_width = 0;
-    gpu_surface_.visible_height = 0;
-    gpu_surface_.format = kFlutterDesktopPixelFormatBGRA8888;
-    gpu_surface_.release_callback = nullptr;
-    gpu_surface_.release_context = nullptr;
-
-    pixel_buffer_.buffer = nullptr;
-    pixel_buffer_.width = 0;
-    pixel_buffer_.height = 0;
-    pixel_buffer_.release_context = nullptr;
-    pixel_buffer_.release_callback = nullptr;
   }
 
   ~WindowsWebViewInstance() { Dispose(); }
@@ -532,34 +971,35 @@ class WindowsWebViewInstance
       texture_variant_ = std::make_unique<flutter::TextureVariant>(
           flutter::GpuSurfaceTexture(
               kFlutterDesktopGpuSurfaceTypeDxgiSharedHandle,
-              [this](size_t /*width*/, size_t /*height*/)
+              [state = frame_state_](size_t /*width*/, size_t /*height*/)
                   -> const FlutterDesktopGpuSurfaceDescriptor* {
-                std::lock_guard<std::mutex> lock(buffer_mutex_);
-                if (front_gpu_handle_ == nullptr || gpu_width_ == 0 ||
-                    gpu_height_ == 0) {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                if (state->front_gpu_handle == nullptr ||
+                    state->gpu_width == 0 || state->gpu_height == 0) {
                   return nullptr;
                 }
-                gpu_surface_.handle = front_gpu_handle_;
-                gpu_surface_.width = gpu_width_;
-                gpu_surface_.height = gpu_height_;
-                gpu_surface_.visible_width = gpu_width_;
-                gpu_surface_.visible_height = gpu_height_;
-                return &gpu_surface_;
+                state->gpu_surface.handle = state->front_gpu_handle;
+                state->gpu_surface.width = state->gpu_width;
+                state->gpu_surface.height = state->gpu_height;
+                state->gpu_surface.visible_width = state->gpu_width;
+                state->gpu_surface.visible_height = state->gpu_height;
+                return &state->gpu_surface;
               }));
     } else {
       texture_variant_ = std::make_unique<flutter::TextureVariant>(
           flutter::PixelBufferTexture(
-              [this](size_t /*width*/,
-                     size_t /*height*/) -> const FlutterDesktopPixelBuffer* {
-                std::lock_guard<std::mutex> lock(buffer_mutex_);
-                if (rgba_front_.empty() || front_width_ == 0 ||
-                    front_height_ == 0) {
+              [state = frame_state_](size_t /*width*/,
+                                     size_t /*height*/)
+                  -> const FlutterDesktopPixelBuffer* {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                if (state->rgba_front.empty() || state->front_width == 0 ||
+                    state->front_height == 0) {
                   return nullptr;
                 }
-                pixel_buffer_.buffer = rgba_front_.data();
-                pixel_buffer_.width = front_width_;
-                pixel_buffer_.height = front_height_;
-                return &pixel_buffer_;
+                state->pixel_buffer.buffer = state->rgba_front.data();
+                state->pixel_buffer.width = state->front_width;
+                state->pixel_buffer.height = state->front_height;
+                return &state->pixel_buffer;
               }));
     }
     texture_id_ = texture_registrar_->RegisterTexture(texture_variant_.get());
@@ -583,7 +1023,14 @@ class WindowsWebViewInstance
   void SetSizeInternal(int width, int height, double scale_factor);
   void SetVisibilityInternal(bool visible);
   void HandlePointerEvent(const flutter::EncodableMap& args);
+  void RestoreFlutterViewInputState(HWND prev_focus, HWND prev_capture);
   void HandleKeyEvent(const flutter::EncodableMap& args);
+  HRESULT HandleContextMenuRequested(
+      ICoreWebView2ContextMenuRequestedEventArgs* args);
+  void ShowContextMenu(ICoreWebView2ContextMenuRequestedEventArgs* args,
+                       ICoreWebView2ContextMenuItemCollection* items,
+                       POINT screen_pt);
+  void CancelActiveContextMenu();
   void RebuildChannelScript();
   void LoadHtmlInternal(const std::string& html, const std::string& base_url);
   void LoadRequestInternal(const std::string& url,
@@ -595,32 +1042,29 @@ class WindowsWebViewInstance
                     std::function<void()> on_cancel = nullptr);
   bool SetupCapturePipeline();
   void OnCaptureFrameArrived();
+  void RetireSharedTextures();
+  void PruneRetiredTextures();
 
   int64_t controller_id_ = 0;
   WebviewCorePlugin* plugin_ = nullptr;
   flutter::TextureRegistrar* texture_registrar_ = nullptr;
   CompositionGraphicsRuntime* gfx_ = nullptr;
   HWND parent_hwnd_ = nullptr;
+  HWND top_hwnd_ = nullptr;
+  HWND host_hwnd_ = nullptr;
 
   int64_t texture_id_ = -1;
   bool use_gpu_surface_ = false;
   std::unique_ptr<flutter::TextureVariant> texture_variant_;
 
-  std::mutex buffer_mutex_;
+  std::shared_ptr<TextureFrameState> frame_state_ =
+      std::make_shared<TextureFrameState>();
   ComPtr<ID3D11Texture2D> shared_textures_[2];
   HANDLE shared_handles_[2] = {nullptr, nullptr};
   UINT shared_tex_width_ = 0;
   UINT shared_tex_height_ = 0;
   size_t shared_write_idx_ = 0;
-  HANDLE front_gpu_handle_ = nullptr;
-  size_t gpu_width_ = 0;
-  size_t gpu_height_ = 0;
-  FlutterDesktopGpuSurfaceDescriptor gpu_surface_{};
-
-  std::vector<uint8_t> rgba_front_;
-  size_t front_width_ = 0;
-  size_t front_height_ = 0;
-  FlutterDesktopPixelBuffer pixel_buffer_{};
+  std::vector<RetiredSharedTextures> retired_textures_;
 
   ComPtr<ID3D11Texture2D> staging_texture_;
   UINT staging_width_ = 0;
@@ -647,10 +1091,17 @@ class WindowsWebViewInstance
   EventRegistrationToken web_message_token_{};
   EventRegistrationToken web_resource_token_{};
   bool has_web_resource_token_ = false;
+  EventRegistrationToken context_menu_token_{};
+  bool has_context_menu_token_ = false;
+  EventRegistrationToken new_window_token_{};
+  bool has_new_window_token_ = false;
+  EventRegistrationToken move_focus_token_{};
+  bool has_move_focus_token_ = false;
   std::wstring channel_script_id_;
 
   std::string large_html_utf8_;
   std::string large_html_virtual_uri_;
+  std::wstring html_filter_pattern_;
   uint64_t large_html_seq_ = 0;
 
   std::string pending_custom_req_uri_;
@@ -672,6 +1123,9 @@ class WindowsWebViewInstance
   std::wstring custom_user_agent_;
   std::set<std::string> channel_names_;
   std::vector<PendingOp> pending_ops_;
+  POINT last_context_screen_pt_{};
+  bool has_last_context_screen_pt_ = false;
+  bool showing_context_menu_ = false;
   bool ready_ = false;
   bool disposed_ = false;
 };
@@ -825,8 +1279,10 @@ class WebviewCorePlugin : public flutter::Plugin {
         }
       }
       if (method == "clearCookies") {
+        pending_cookies_.clear();
         result->Success(flutter::EncodableValue(false));
       } else {
+        pending_cookies_.push_back(*args);
         result->Success();
       }
       return;
@@ -856,7 +1312,14 @@ class WebviewCorePlugin : public flutter::Plugin {
           controller_id, this, registrar_->texture_registrar(), &gfx_);
       const int64_t tex_id = inst->RegisterFlutterTexture();
       instances_[controller_id] = inst;
-
+      if (!pending_cookies_.empty()) {
+        std::vector<flutter::EncodableMap> cookies;
+        cookies.swap(pending_cookies_);
+        for (const auto& cookie : cookies) {
+          inst->HandleCall("setCookie", cookie,
+                           std::make_unique<DiscardingMethodResult>());
+        }
+      }
       HWND hwnd = nullptr;
       if (registrar_->GetView() != nullptr) {
         hwnd = registrar_->GetView()->GetNativeWindow();
@@ -909,6 +1372,10 @@ class WebviewCorePlugin : public flutter::Plugin {
   bool creating_env_ = false;
   std::vector<std::function<void(ICoreWebView2Environment3*)>> env_waiters_;
   std::map<int64_t, std::shared_ptr<WindowsWebViewInstance>> instances_;
+  // Cookies set through `WebViewCookieManager` before any view exists. WebView2
+  // exposes the cookie jar only through a live view, so they are replayed into
+  // the first view that is created.
+  std::vector<flutter::EncodableMap> pending_cookies_;
   bool disposed_ = false;
 };
 
@@ -1020,6 +1487,33 @@ bool WindowsWebViewInstance::SetupCapturePipeline() {
   return SUCCEEDED(hr);
 }
 
+void WindowsWebViewInstance::RetireSharedTextures() {
+  if (!shared_textures_[0] && !shared_textures_[1]) {
+    return;
+  }
+  RetiredSharedTextures retired;
+  retired.textures[0] = std::move(shared_textures_[0]);
+  retired.textures[1] = std::move(shared_textures_[1]);
+  retired.retired_at_ms = GetTickCount64();
+  retired_textures_.push_back(std::move(retired));
+  shared_textures_[0].Reset();
+  shared_textures_[1].Reset();
+}
+
+void WindowsWebViewInstance::PruneRetiredTextures() {
+  if (retired_textures_.empty()) {
+    return;
+  }
+  const ULONGLONG now = GetTickCount64();
+  retired_textures_.erase(
+      std::remove_if(retired_textures_.begin(), retired_textures_.end(),
+                     [now](const RetiredSharedTextures& r) {
+                       return now - r.retired_at_ms >
+                              kRetiredTextureLifetimeMs;
+                     }),
+      retired_textures_.end());
+}
+
 void WindowsWebViewInstance::OnCaptureFrameArrived() {
   if (disposed_ || !frame_pool_ || gfx_ == nullptr) {
     return;
@@ -1046,10 +1540,11 @@ void WindowsWebViewInstance::OnCaptureFrameArrived() {
             if (!shared_textures_[0] || !shared_textures_[1] ||
                 shared_tex_width_ != desc.Width ||
                 shared_tex_height_ != desc.Height) {
-              std::lock_guard<std::mutex> lock(buffer_mutex_);
-              front_gpu_handle_ = nullptr;
-              shared_textures_[0].Reset();
-              shared_textures_[1].Reset();
+              {
+                std::lock_guard<std::mutex> lock(frame_state_->mutex);
+                frame_state_->front_gpu_handle = nullptr;
+              }
+              RetireSharedTextures();
               shared_handles_[0] = nullptr;
               shared_handles_[1] = nullptr;
 
@@ -1083,8 +1578,7 @@ void WindowsWebViewInstance::OnCaptureFrameArrived() {
                 shared_tex_width_ = desc.Width;
                 shared_tex_height_ = desc.Height;
               } else {
-                shared_textures_[0].Reset();
-                shared_textures_[1].Reset();
+                RetireSharedTextures();
                 shared_handles_[0] = nullptr;
                 shared_handles_[1] = nullptr;
               }
@@ -1096,12 +1590,13 @@ void WindowsWebViewInstance::OnCaptureFrameArrived() {
                                                 src_tex.Get());
               gfx_->d3d_context()->Flush();
               {
-                std::lock_guard<std::mutex> lock(buffer_mutex_);
-                front_gpu_handle_ = shared_handles_[idx];
-                gpu_width_ = static_cast<size_t>(desc.Width);
-                gpu_height_ = static_cast<size_t>(desc.Height);
+                std::lock_guard<std::mutex> lock(frame_state_->mutex);
+                frame_state_->front_gpu_handle = shared_handles_[idx];
+                frame_state_->gpu_width = static_cast<size_t>(desc.Width);
+                frame_state_->gpu_height = static_cast<size_t>(desc.Height);
                 shared_write_idx_ = idx ^ 1u;
               }
+              PruneRetiredTextures();
               if (texture_registrar_ != nullptr && texture_id_ >= 0) {
                 texture_registrar_->MarkTextureFrameAvailable(texture_id_);
               }
@@ -1128,16 +1623,16 @@ void WindowsWebViewInstance::OnCaptureFrameArrived() {
               if (SUCCEEDED(gfx_->d3d_context()->Map(
                       staging_texture_.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
                 {
-                  std::lock_guard<std::mutex> lock(buffer_mutex_);
+                  std::lock_guard<std::mutex> lock(frame_state_->mutex);
                   const size_t w = static_cast<size_t>(desc.Width);
                   const size_t h = static_cast<size_t>(desc.Height);
-                  rgba_front_.resize(w * h * 4);
+                  frame_state_->rgba_front.resize(w * h * 4);
                   for (size_t row = 0; row < h; ++row) {
                     const auto* src_row = reinterpret_cast<const uint32_t*>(
                         static_cast<const uint8_t*>(mapped.pData) +
                         row * mapped.RowPitch);
                     auto* dst_row = reinterpret_cast<uint32_t*>(
-                        rgba_front_.data() + row * w * 4);
+                        frame_state_->rgba_front.data() + row * w * 4);
                     for (size_t col = 0; col < w; ++col) {
                       const uint32_t px = src_row[col];
                       dst_row[col] = (px & 0xFF00FF00u) |
@@ -1145,8 +1640,8 @@ void WindowsWebViewInstance::OnCaptureFrameArrived() {
                                      ((px & 0x000000FFu) << 16);
                     }
                   }
-                  front_width_ = w;
-                  front_height_ = h;
+                  frame_state_->front_width = w;
+                  frame_state_->front_height = h;
                 }
                 gfx_->d3d_context()->Unmap(staging_texture_.Get(), 0);
                 if (texture_registrar_ != nullptr && texture_id_ >= 0) {
@@ -1185,6 +1680,12 @@ void WindowsWebViewInstance::Initialize(
     return;
   }
   parent_hwnd_ = parent_hwnd;
+  if (parent_hwnd != nullptr && parent_hwnd != ::GetDesktopWindow() &&
+      ::IsWindow(parent_hwnd)) {
+    top_hwnd_ = ::GetAncestor(parent_hwnd, GA_ROOT);
+    EnsureFlutterViewGuarded(parent_hwnd);
+  }
+  host_hwnd_ = CreateCompositionHostWindow(top_hwnd_, parent_hwnd_);
   env3_ = env3;
   js_enabled_ = GetBoolArg(creation_args, "javaScriptEnabled", true);
   zoom_enabled_ = GetBoolArg(creation_args, "zoomEnabled", true);
@@ -1219,9 +1720,11 @@ void WindowsWebViewInstance::Initialize(
     return;
   }
 
+  const HWND composition_parent =
+      host_hwnd_ != nullptr ? host_hwnd_ : parent_hwnd_;
   std::weak_ptr<WindowsWebViewInstance> weak_self = shared_from_this();
   env3_->CreateCoreWebView2CompositionController(
-      parent_hwnd,
+      composition_parent,
       Callback<ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler>(
           [weak_self, creation_args](
               HRESULT result,
@@ -1244,6 +1747,40 @@ void WindowsWebViewInstance::Initialize(
                 !self->webview_) {
               self->CancelPendingOps();
               return S_OK;
+            }
+
+            const HWND scan_parent = self->host_hwnd_ != nullptr
+                                         ? self->host_hwnd_
+                                         : self->parent_hwnd_;
+            if (scan_parent != nullptr && ::IsWindow(scan_parent)) {
+              for (HWND child = ::GetWindow(scan_parent, GW_CHILD);
+                   child != nullptr;
+                   child = ::GetWindow(child, GW_HWNDNEXT)) {
+                if (child != self->parent_hwnd_) {
+                  ::SetPropW(child, kInternalWebViewHwndProp,
+                             reinterpret_cast<HANDLE>(1));
+                }
+              }
+            }
+
+            if (SUCCEEDED(self->controller_->add_MoveFocusRequested(
+                    Callback<ICoreWebView2MoveFocusRequestedEventHandler>(
+                        [weak_self](
+                            ICoreWebView2Controller* /*sender*/,
+                            ICoreWebView2MoveFocusRequestedEventArgs* args)
+                            -> HRESULT {
+                          if (args != nullptr) {
+                            args->put_Handled(TRUE);
+                          }
+                          if (auto inst = weak_self.lock()) {
+                            inst->RestoreFlutterViewInputState(
+                                inst->parent_hwnd_, ::GetCapture());
+                          }
+                          return S_OK;
+                        })
+                        .Get(),
+                    &self->move_focus_token_))) {
+              self->has_move_focus_token_ = true;
             }
 
             if (self->container_visual_) {
@@ -1316,7 +1853,8 @@ void WindowsWebViewInstance::Initialize(
                                     inst->env3_->CreateWebResourceResponse(
                                         mem_stream.Get(), 200, L"OK",
                                         L"Content-Type: text/html; "
-                                        L"charset=utf-8",
+                                        L"charset=utf-8\r\n"
+                                         L"Cache-Control: no-store",
                                         &resp)) &&
                                 resp) {
                               args->put_Response(resp.Get());
@@ -1392,6 +1930,59 @@ void WindowsWebViewInstance::Initialize(
                     })
                     .Get(),
                 &self->nav_starting_token_);
+
+            // Composition hosting renders no default context menu: surface the
+            // Edge menu (Back, Forward, Reload, Copy, ...) as a native popup.
+            ComPtr<ICoreWebView2_11> webview11;
+            if (SUCCEEDED(self->webview_.As(&webview11)) && webview11) {
+              if (SUCCEEDED(webview11->add_ContextMenuRequested(
+                      Callback<ICoreWebView2ContextMenuRequestedEventHandler>(
+                          [weak_self](
+                              ICoreWebView2* /*sender*/,
+                              ICoreWebView2ContextMenuRequestedEventArgs* args)
+                              -> HRESULT {
+                            auto inst = weak_self.lock();
+                            if (!inst || inst->disposed_ || args == nullptr) {
+                              return S_OK;
+                            }
+                            return inst->HandleContextMenuRequested(args);
+                          })
+                          .Get(),
+                      &self->context_menu_token_))) {
+                self->has_context_menu_token_ = true;
+              }
+            }
+
+            // target="_blank" / window.open(): embedded views have no tab
+            // strip, so open http(s) targets in place.
+            if (SUCCEEDED(self->webview_->add_NewWindowRequested(
+                    Callback<ICoreWebView2NewWindowRequestedEventHandler>(
+                        [weak_self](
+                            ICoreWebView2* sender,
+                            ICoreWebView2NewWindowRequestedEventArgs* args)
+                            -> HRESULT {
+                          auto inst = weak_self.lock();
+                          if (!inst || inst->disposed_ || args == nullptr) {
+                            return S_OK;
+                          }
+                          args->put_Handled(TRUE);
+                          LPWSTR uri_w = nullptr;
+                          if (SUCCEEDED(args->get_Uri(&uri_w)) &&
+                              uri_w != nullptr) {
+                            const std::wstring target(uri_w);
+                            CoTaskMemFree(uri_w);
+                            if (sender != nullptr &&
+                                (target.rfind(L"http://", 0) == 0 ||
+                                 target.rfind(L"https://", 0) == 0)) {
+                              sender->Navigate(target.c_str());
+                            }
+                          }
+                          return S_OK;
+                        })
+                        .Get(),
+                    &self->new_window_token_))) {
+              self->has_new_window_token_ = true;
+            }
 
             self->webview_->add_NavigationCompleted(
                 Callback<ICoreWebView2NavigationCompletedEventHandler>(
@@ -1581,12 +2172,24 @@ void WindowsWebViewInstance::Dispose() {
     return;
   }
   disposed_ = true;
+  CancelActiveContextMenu();
   CancelPendingOps();
 
   if (webview_) {
     if (has_web_resource_token_) {
       webview_->remove_WebResourceRequested(web_resource_token_);
       has_web_resource_token_ = false;
+    }
+    if (has_context_menu_token_) {
+      ComPtr<ICoreWebView2_11> webview11;
+      if (SUCCEEDED(webview_.As(&webview11)) && webview11) {
+        webview11->remove_ContextMenuRequested(context_menu_token_);
+      }
+      has_context_menu_token_ = false;
+    }
+    if (has_new_window_token_) {
+      webview_->remove_NewWindowRequested(new_window_token_);
+      has_new_window_token_ = false;
     }
     webview_->remove_NavigationStarting(nav_starting_token_);
     webview_->remove_NavigationCompleted(nav_completed_token_);
@@ -1600,8 +2203,22 @@ void WindowsWebViewInstance::Dispose() {
     comp_controller_.Reset();
   }
   if (controller_) {
+    if (has_move_focus_token_) {
+      controller_->remove_MoveFocusRequested(move_focus_token_);
+      has_move_focus_token_ = false;
+    }
     controller_->Close();
     controller_.Reset();
+  }
+  if (host_hwnd_ != nullptr) {
+    if (::IsWindow(host_hwnd_)) {
+      for (HWND child = ::GetWindow(host_hwnd_, GW_CHILD); child != nullptr;
+           child = ::GetWindow(child, GW_HWNDNEXT)) {
+        ::RemovePropW(child, kInternalWebViewHwndProp);
+      }
+      ::DestroyWindow(host_hwnd_);
+    }
+    host_hwnd_ = nullptr;
   }
   if (frame_pool_ && has_frame_token_) {
     frame_pool_->remove_FrameArrived(frame_arrived_token_);
@@ -1631,18 +2248,25 @@ void WindowsWebViewInstance::Dispose() {
     texture_id_ = -1;
     std::shared_ptr<flutter::TextureVariant> keep_alive(
         std::move(texture_variant_));
-    ComPtr<ID3D11Texture2D> keep_tex0 = shared_textures_[0];
-    ComPtr<ID3D11Texture2D> keep_tex1 = shared_textures_[1];
+    // Hand every texture the engine may still import to the unregister
+    // callback: it runs only once the engine no longer uses this texture.
+    auto keep_textures = std::make_shared<std::vector<RetiredSharedTextures>>(
+        std::move(retired_textures_));
+    RetiredSharedTextures current;
+    current.textures[0] = shared_textures_[0];
+    current.textures[1] = shared_textures_[1];
+    keep_textures->push_back(std::move(current));
+    auto keep_state = frame_state_;
     {
-      std::lock_guard<std::mutex> lock(buffer_mutex_);
-      front_gpu_handle_ = nullptr;
-      shared_textures_[0].Reset();
-      shared_textures_[1].Reset();
-      shared_handles_[0] = nullptr;
-      shared_handles_[1] = nullptr;
+      std::lock_guard<std::mutex> lock(frame_state_->mutex);
+      frame_state_->front_gpu_handle = nullptr;
     }
+    shared_textures_[0].Reset();
+    shared_textures_[1].Reset();
+    shared_handles_[0] = nullptr;
+    shared_handles_[1] = nullptr;
     texture_registrar_->UnregisterTexture(
-        id_to_remove, [keep_alive, keep_tex0, keep_tex1]() {});
+        id_to_remove, [keep_alive, keep_textures, keep_state]() {});
   }
 }
 
@@ -1671,19 +2295,46 @@ void WindowsWebViewInstance::LoadHtmlInternal(const std::string& html,
   }
   std::string resolved = InjectBaseTagIfNeeded(html, base_url);
   has_pending_custom_req_ = false;
-  if (resolved.size() <= kMaxInlineNavigateToStringBytes) {
+
+  // `NavigateToString` documents have an opaque origin (`about:blank`), so
+  // `document.cookie`, `localStorage`, `fetch` and same-origin frames all fail
+  // with `SecurityError`. When the caller supplies an http(s) base URL, serve
+  // the HTML *as* that URL so the document gets the base URL's real origin
+  // (this matches `WKWebView.loadHTMLString(baseURL:)` and Android).
+  const bool has_http_base = base_url.rfind("http://", 0) == 0 ||
+                             base_url.rfind("https://", 0) == 0;
+  if (!has_http_base && resolved.size() <= kMaxInlineNavigateToStringBytes) {
     large_html_utf8_.clear();
     large_html_virtual_uri_.clear();
     const std::wstring whtml = Utf8ToWide(resolved);
     webview_->NavigateToString(whtml.c_str());
     return;
   }
-  ++large_html_seq_;
-  large_html_virtual_uri_ = "http://webview-core.invalid/__inline_" +
-                            std::to_string(large_html_seq_) + ".html";
+
+  std::string virtual_uri;
+  if (has_http_base) {
+    virtual_uri = base_url;
+  } else {
+    ++large_html_seq_;
+    virtual_uri = "http://webview-core.invalid/__inline_" +
+                  std::to_string(large_html_seq_) + ".html";
+  }
   large_html_utf8_ = std::move(resolved);
-  approved_navigation_uri_ = large_html_virtual_uri_;
+  large_html_virtual_uri_ = virtual_uri;
+  if (!has_http_base) {
+    approved_navigation_uri_ = large_html_virtual_uri_;
+  }
   const std::wstring wuri = Utf8ToWide(large_html_virtual_uri_);
+  if (has_http_base && wuri != html_filter_pattern_) {
+    if (!html_filter_pattern_.empty()) {
+      webview_->RemoveWebResourceRequestedFilter(
+          html_filter_pattern_.c_str(),
+          COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT);
+    }
+    webview_->AddWebResourceRequestedFilter(
+        wuri.c_str(), COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT);
+    html_filter_pattern_ = wuri;
+  }
   webview_->Navigate(wuri.c_str());
 }
 
@@ -1750,6 +2401,9 @@ void WindowsWebViewInstance::SetSizeInternal(int width,
 
 void WindowsWebViewInstance::SetVisibilityInternal(bool visible) {
   visible_ = visible;
+  if (!visible) {
+    CancelActiveContextMenu();
+  }
   if (root_visual_) {
     root_visual_->put_IsVisible(visible ? TRUE : FALSE);
   }
@@ -1874,6 +2528,136 @@ void WindowsWebViewInstance::LoadRequestInternal(
   webview_->Navigate(wurl.c_str());
 }
 
+void WindowsWebViewInstance::CancelActiveContextMenu() {
+  if (!showing_context_menu_) {
+    return;
+  }
+  ::EndMenu();
+  const HWND menu_owner =
+      (top_hwnd_ != nullptr && ::IsWindow(top_hwnd_)) ? top_hwnd_
+                                                      : parent_hwnd_;
+  if (menu_owner != nullptr && ::IsWindow(menu_owner)) {
+    ::SendMessageW(menu_owner, WM_CANCELMODE, 0, 0);
+  }
+}
+
+HRESULT WindowsWebViewInstance::HandleContextMenuRequested(
+    ICoreWebView2ContextMenuRequestedEventArgs* args) {
+  if (args == nullptr) {
+    return S_OK;
+  }
+  if (disposed_ || !visible_ || parent_hwnd_ == nullptr) {
+    args->put_Handled(TRUE);
+    return S_OK;
+  }
+  ComPtr<ICoreWebView2ContextMenuItemCollection> items;
+  if (FAILED(args->get_MenuItems(&items)) || !items) {
+    args->put_Handled(TRUE);
+    return S_OK;
+  }
+  UINT32 count = 0;
+  if (FAILED(items->get_Count(&count)) || count == 0) {
+    args->put_Handled(TRUE);
+    return S_OK;
+  }
+
+  POINT menu_pt{};
+  if (::GetCursorPos(&menu_pt) == FALSE) {
+    if (has_last_context_screen_pt_) {
+      menu_pt = last_context_screen_pt_;
+    } else if (::IsWindow(parent_hwnd_)) {
+      RECT rc{};
+      if (::GetWindowRect(parent_hwnd_, &rc) != FALSE) {
+        menu_pt.x = rc.left + (rc.right - rc.left) / 2;
+        menu_pt.y = rc.top + (rc.bottom - rc.top) / 2;
+      }
+    }
+  }
+
+  // `TrackPopupMenu` runs a modal message loop. Doing that inside the event
+  // handler stalls WebView2 event delivery (every `ExecuteScript` completion
+  // and channel round trip hangs until the menu closes). Take a deferral and
+  // show the menu from a later message-loop turn instead.
+  ComPtr<ICoreWebView2Deferral> deferral;
+  if (FAILED(args->GetDeferral(&deferral)) || !deferral) {
+    args->put_Handled(TRUE);
+    return S_OK;
+  }
+  ComPtr<ICoreWebView2ContextMenuRequestedEventArgs> args_ref(args);
+  std::weak_ptr<WindowsWebViewInstance> weak_self = shared_from_this();
+  const bool queued = gfx_ != nullptr && gfx_->PostToUiThread(
+      [weak_self, args_ref, items, deferral, menu_pt]() {
+        if (auto inst = weak_self.lock()) {
+          if (!inst->disposed_ && inst->visible_) {
+            inst->ShowContextMenu(args_ref.Get(), items.Get(), menu_pt);
+          } else {
+            args_ref->put_Handled(TRUE);
+          }
+        } else {
+          args_ref->put_Handled(TRUE);
+        }
+        deferral->Complete();
+      });
+  if (!queued) {
+    args->put_Handled(TRUE);
+    deferral->Complete();
+  }
+  return S_OK;
+}
+
+void WindowsWebViewInstance::ShowContextMenu(
+    ICoreWebView2ContextMenuRequestedEventArgs* args,
+    ICoreWebView2ContextMenuItemCollection* items,
+    POINT screen_pt) {
+  if (args == nullptr) {
+    return;
+  }
+  // Always mark handled so WebView2 never falls back to anchoring its own menu
+  // against the off-client (-32000, -32000) composition host HWND (which
+  // Windows clamps to monitor (0, 0)).
+  args->put_Handled(TRUE);
+
+  const HWND menu_owner =
+      (top_hwnd_ != nullptr && ::IsWindow(top_hwnd_)) ? top_hwnd_
+                                                      : parent_hwnd_;
+  if (items == nullptr || menu_owner == nullptr || !::IsWindow(menu_owner) ||
+      !::IsWindowVisible(menu_owner) || ::IsIconic(menu_owner)) {
+    return;
+  }
+  HMENU menu = CreatePopupMenu();
+  if (menu == nullptr) {
+    return;
+  }
+  std::map<UINT, INT32> command_ids;
+  UINT next_id = 1;
+  AppendContextMenuItems(menu, items, &command_ids, &next_id);
+  TrimTrailingMenuSeparator(menu);
+
+  if (GetMenuItemCount(menu) > 0) {
+    showing_context_menu_ = true;
+    SetForegroundWindow(menu_owner);
+    const UINT picked = static_cast<UINT>(TrackPopupMenu(
+        menu,
+        TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN |
+            TPM_RIGHTBUTTON,
+        screen_pt.x, screen_pt.y, 0, menu_owner, nullptr));
+    showing_context_menu_ = false;
+    ::PostMessageW(menu_owner, WM_NULL, 0, 0);
+    if (picked != 0 && !disposed_) {
+      const auto found = command_ids.find(picked);
+      if (found != command_ids.end()) {
+        args->put_SelectedCommandId(found->second);
+      }
+    }
+    if (!disposed_ && parent_hwnd_ != nullptr &&
+        parent_hwnd_ != ::GetDesktopWindow() && ::IsWindow(parent_hwnd_) &&
+        ::GetActiveWindow() == menu_owner && ::GetFocus() != parent_hwnd_) {
+      ::SetFocus(parent_hwnd_);
+    }
+  }
+  DestroyMenu(menu);
+}
+
 void WindowsWebViewInstance::HandlePointerEvent(
     const flutter::EncodableMap& args) {
   if (!comp_controller_) {
@@ -1884,6 +2668,14 @@ void WindowsWebViewInstance::HandlePointerEvent(
   int64_t buttons = 0;
   GetIntArg(args, "button", &button);
   GetIntArg(args, "buttons", &buttons);
+  if ((kind == "down" || kind == "up") &&
+      (button == 2 || (buttons & 2) != 0)) {
+    POINT cur{};
+    if (::GetCursorPos(&cur) != FALSE) {
+      last_context_screen_pt_ = cur;
+      has_last_context_screen_pt_ = true;
+    }
+  }
   const double x = GetDoubleArg(args, "x", 0.0);
   const double y = GetDoubleArg(args, "y", 0.0);
   const double dx = GetDoubleArg(args, "deltaX", 0.0);
@@ -1914,6 +2706,9 @@ void WindowsWebViewInstance::HandlePointerEvent(
   POINT pt{};
   pt.x = static_cast<LONG>(std::lround(x));
   pt.y = static_cast<LONG>(std::lround(y));
+
+  const HWND prev_focus = ::GetFocus();
+  const HWND prev_capture = ::GetCapture();
 
   if (kind == "move") {
     comp_controller_->SendMouseInput(COREWEBVIEW2_MOUSE_EVENT_KIND_MOVE, vkeys,
@@ -1958,16 +2753,46 @@ void WindowsWebViewInstance::HandlePointerEvent(
           COREWEBVIEW2_MOUSE_EVENT_KIND_HORIZONTAL_WHEEL, vkeys, wheel_x, pt);
     }
   }
+
+  RestoreFlutterViewInputState(prev_focus, prev_capture);
+}
+
+void WindowsWebViewInstance::RestoreFlutterViewInputState(
+    HWND prev_focus,
+    HWND prev_capture) {
+  if (parent_hwnd_ == nullptr || parent_hwnd_ == ::GetDesktopWindow() ||
+      !::IsWindow(parent_hwnd_)) {
+    return;
+  }
+  const HWND cur_capture = ::GetCapture();
+  if (cur_capture != prev_capture && IsInternalWebViewWindow(cur_capture)) {
+    if (prev_capture == parent_hwnd_ && IsAnyMouseButtonPressed()) {
+      ::SetCapture(parent_hwnd_);
+    } else {
+      ::ReleaseCapture();
+    }
+  }
+  const HWND cur_focus = ::GetFocus();
+  if (cur_focus != prev_focus && IsInternalWebViewWindow(cur_focus) &&
+      prev_focus == parent_hwnd_) {
+    ::SetFocus(parent_hwnd_);
+  }
 }
 
 void WindowsWebViewInstance::HandleKeyEvent(const flutter::EncodableMap& args) {
   if (!webview_ || !controller_) {
     return;
   }
-  if (parent_hwnd_ != nullptr && ::GetFocus() != parent_hwnd_) {
-    return;
+  if (parent_hwnd_ != nullptr && parent_hwnd_ != ::GetDesktopWindow() &&
+      ::GetFocus() != parent_hwnd_) {
+    const HWND active = ::GetActiveWindow();
+    if (active == parent_hwnd_ ||
+        (top_hwnd_ != nullptr && active == top_hwnd_)) {
+      ::SetFocus(parent_hwnd_);
+    } else {
+      return;
+    }
   }
-  controller_->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
 
   const std::string logical_key = GetStringArg(args, "logicalKey");
   bool has_char = false;
@@ -2057,13 +2882,19 @@ void WindowsWebViewInstance::HandleCall(
   }
 
   if (method == "setFocus") {
-    const bool focused = GetBoolArg(args, "focused", false);
-    if (focused) {
-      if (controller_) {
-        controller_->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+    // Keep Win32 HWND focus on `FLUTTERVIEW` (`parent_hwnd_`) at all times so
+    // Flutter continues to receive all pointer and keyboard messages. Calling
+    // `controller_->MoveFocus` moves Win32 focus into WebView2's internal child
+    // HWND, breaking Flutter input delivery; in-page DOM focus is driven by
+    // `SendMouseInput` clicks instead.
+    (void)args;
+    if (parent_hwnd_ != nullptr && parent_hwnd_ != ::GetDesktopWindow() &&
+        ::IsWindow(parent_hwnd_) && ::GetFocus() != parent_hwnd_) {
+      const HWND active = ::GetActiveWindow();
+      if (active == parent_hwnd_ ||
+          (top_hwnd_ != nullptr && active == top_hwnd_)) {
+        ::SetFocus(parent_hwnd_);
       }
-    } else if (parent_hwnd_ != nullptr && ::GetFocus() != parent_hwnd_) {
-      ::SetFocus(parent_hwnd_);
     }
     result->Success();
     return;

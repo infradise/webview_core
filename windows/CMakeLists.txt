@@ -78,6 +78,7 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE
   flutter
   flutter_wrapper_plugin
   "${WEBVIEW2_STATIC_LIB}"
+  comctl32
   d3d11
   dxgi
   ole32

@@ -663,4 +663,327 @@ void main() {
       debugDefaultTargetPlatformOverride = null;
     },
   );
+
+  testWidgets(
+    'Windows host does not swallow Tab, function keys, modifier-only or Meta combos',
+    (WidgetTester tester) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+
+      final controller = WebViewController();
+      await controller.loadHtmlString('<p>keys</p>');
+
+      await tester.pumpWidget(
+        Directionality(
+          textDirection: TextDirection.ltr,
+          child: SizedBox(
+            width: 200,
+            height: 100,
+            child: WebViewWidget(controller: controller),
+          ),
+        ),
+      );
+      await tester.pump();
+
+      // Give the WebView host keyboard focus.
+      await tester.tap(find.byType(Texture));
+      await tester.pump();
+
+      Iterable<MethodCall> keyCalls() =>
+          recordedCalls.where((MethodCall c) => c.method == 'keyEvent');
+
+      // Letters are forwarded to WebView2 and consumed.
+      recordedCalls.clear();
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyA);
+      await tester.pump();
+      expect(keyCalls(), isNotEmpty);
+
+      // Tab, F-keys, Escape, and modifier-only presses must stay with Flutter.
+      for (final key in <LogicalKeyboardKey>[
+        LogicalKeyboardKey.tab,
+        LogicalKeyboardKey.f5,
+        LogicalKeyboardKey.escape,
+        LogicalKeyboardKey.shiftLeft,
+        LogicalKeyboardKey.controlLeft,
+      ]) {
+        recordedCalls.clear();
+        await tester.sendKeyEvent(key);
+        await tester.pump();
+        expect(
+          keyCalls(),
+          isEmpty,
+          reason: '${key.keyLabel} must pass through',
+        );
+      }
+
+      // Windows-key (Meta) combinations must stay with the application.
+      recordedCalls.clear();
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.metaLeft);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyD);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.metaLeft);
+      await tester.pump();
+      expect(keyCalls(), isEmpty);
+
+      await controller.dispose();
+      debugDefaultTargetPlatformOverride = null;
+    },
+  );
+
+  testWidgets(
+    'Windows host releases active mouse buttons before leave on PointerCancelEvent',
+    (WidgetTester tester) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+
+      final controller = WebViewController();
+      await controller.loadHtmlString('<p>cancel</p>');
+
+      await tester.pumpWidget(
+        Directionality(
+          textDirection: TextDirection.ltr,
+          child: SizedBox(
+            width: 200,
+            height: 100,
+            child: WebViewWidget(controller: controller),
+          ),
+        ),
+      );
+      await tester.pump();
+
+      recordedCalls.clear();
+      final gesture = await tester.startGesture(
+        tester.getCenter(find.byType(Texture)),
+        kind: PointerDeviceKind.mouse,
+      );
+      await tester.pump();
+      await gesture.cancel();
+      await tester.pump();
+
+      final pointerKinds = recordedCalls
+          .where((MethodCall c) => c.method == 'pointerEvent')
+          .map((MethodCall c) {
+            final args = c.arguments as Map<Object?, Object?>;
+            return '${args['kind']}:${args['button']}';
+          })
+          .toList();
+      expect(
+        pointerKinds,
+        containsAllInOrder(<String>['down:1', 'up:1', 'leave:0']),
+      );
+
+      await controller.dispose();
+      debugDefaultTargetPlatformOverride = null;
+    },
+  );
+
+  testWidgets(
+    'Linux host syncs geometry on ancestor offset shift across RepaintBoundary without idle polling',
+    (WidgetTester tester) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.linux;
+
+      final controller = WebViewController();
+      await controller.loadHtmlString('<p>RepaintBoundary shift</p>');
+      final offsetNotifier = ValueNotifier<Offset>(const Offset(16, 24));
+
+      await tester.pumpWidget(
+        Directionality(
+          textDirection: TextDirection.ltr,
+          child: ValueListenableBuilder<Offset>(
+            valueListenable: offsetNotifier,
+            builder: (BuildContext context, Offset pos, Widget? child) {
+              return Stack(
+                children: <Widget>[
+                  Positioned(
+                    left: pos.dx,
+                    top: pos.dy,
+                    width: 300,
+                    height: 180,
+                    child: child!,
+                  ),
+                ],
+              );
+            },
+            child: RepaintBoundary(
+              child: WebViewWidget(controller: controller),
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+
+      final initialGeom =
+          recordedCalls
+                  .where((MethodCall c) => c.method == 'setGeometry')
+                  .last
+                  .arguments
+              as Map<Object?, Object?>;
+      expect(initialGeom['visible'], isTrue);
+      expect(initialGeom['x'], 16);
+      expect(initialGeom['y'], 24);
+
+      // Move parent Positioned while RepaintBoundary keeps child from repainting.
+      recordedCalls.clear();
+      offsetNotifier.value = const Offset(120, 96);
+      await tester.pump();
+
+      final shiftedCalls = recordedCalls
+          .where((MethodCall c) => c.method == 'setGeometry')
+          .toList();
+      expect(shiftedCalls, isNotEmpty);
+      final shiftedGeom = shiftedCalls.last.arguments as Map<Object?, Object?>;
+      expect(shiftedGeom['visible'], isTrue);
+      expect(shiftedGeom['x'], 120);
+      expect(shiftedGeom['y'], 96);
+
+      // Verify zero duplicate channel calls when pumping idle frames.
+      recordedCalls.clear();
+      await tester.pump(const Duration(milliseconds: 200));
+      expect(recordedCalls, isEmpty);
+
+      offsetNotifier.dispose();
+      await controller.dispose();
+      debugDefaultTargetPlatformOverride = null;
+    },
+  );
+
+  testWidgets(
+    'Linux host hides when partially occluded by a foreground dropdown or popup card',
+    (WidgetTester tester) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.linux;
+
+      final controller = WebViewController();
+      await controller.loadHtmlString('<p>Partial popup occlusion</p>');
+      final showDropdown = ValueNotifier<bool>(false);
+
+      await tester.pumpWidget(
+        Directionality(
+          textDirection: TextDirection.ltr,
+          child: ValueListenableBuilder<bool>(
+            valueListenable: showDropdown,
+            builder: (BuildContext context, bool open, Widget? _) {
+              return Stack(
+                children: <Widget>[
+                  Positioned(
+                    left: 0,
+                    top: 0,
+                    width: 400,
+                    height: 300,
+                    child: WebViewWidget(controller: controller),
+                  ),
+                  if (open)
+                    const Positioned(
+                      left: 140,
+                      top: 0,
+                      width: 120,
+                      height: 80,
+                      child: AbsorbPointer(
+                        child: ColoredBox(color: Color(0xFF1E293B)),
+                      ),
+                    ),
+                ],
+              );
+            },
+          ),
+        ),
+      );
+      await tester.pump();
+
+      recordedCalls.clear();
+      showDropdown.value = true;
+      await tester.pump();
+      expect(
+        recordedCalls.any((MethodCall c) {
+          if (c.method != 'setGeometry') {
+            return false;
+          }
+          final args = c.arguments as Map<Object?, Object?>;
+          return args['visible'] == false;
+        }),
+        isTrue,
+      );
+
+      recordedCalls.clear();
+      showDropdown.value = false;
+      await tester.pump();
+      expect(
+        recordedCalls.any((MethodCall c) {
+          if (c.method != 'setGeometry') {
+            return false;
+          }
+          final args = c.arguments as Map<Object?, Object?>;
+          return args['visible'] == true;
+        }),
+        isTrue,
+      );
+
+      showDropdown.dispose();
+      await controller.dispose();
+      debugDefaultTargetPlatformOverride = null;
+    },
+  );
+
+  testWidgets(
+    'Linux host enables passThrough during active Flutter pointer drag and restores on release',
+    (WidgetTester tester) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.linux;
+
+      final controller = WebViewController();
+      await controller.loadHtmlString('<p>Splitter drag</p>');
+
+      await tester.pumpWidget(
+        Directionality(
+          textDirection: TextDirection.ltr,
+          child: Row(
+            children: <Widget>[
+              const SizedBox(
+                key: ValueKey<String>('splitter_handle'),
+                width: 16,
+                height: 200,
+              ),
+              SizedBox(
+                width: 300,
+                height: 200,
+                child: WebViewWidget(controller: controller),
+              ),
+            ],
+          ),
+        ),
+      );
+      await tester.pump();
+
+      recordedCalls.clear();
+      final drag = await tester.startGesture(
+        tester.getCenter(find.byKey(const ValueKey<String>('splitter_handle'))),
+        kind: PointerDeviceKind.mouse,
+      );
+      await tester.pump();
+
+      expect(
+        recordedCalls.any((MethodCall c) {
+          if (c.method != 'setGeometry') {
+            return false;
+          }
+          final args = c.arguments as Map<Object?, Object?>;
+          return args['visible'] == true && args['passThrough'] == true;
+        }),
+        isTrue,
+      );
+
+      recordedCalls.clear();
+      await drag.up();
+      await tester.pump();
+
+      expect(
+        recordedCalls.any((MethodCall c) {
+          if (c.method != 'setGeometry') {
+            return false;
+          }
+          final args = c.arguments as Map<Object?, Object?>;
+          return args['visible'] == true && args['passThrough'] == false;
+        }),
+        isTrue,
+      );
+
+      await controller.dispose();
+      debugDefaultTargetPlatformOverride = null;
+    },
+  );
 }
