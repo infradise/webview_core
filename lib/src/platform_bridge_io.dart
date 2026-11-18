@@ -280,8 +280,8 @@ final class IoWebViewBridge extends WebViewPlatformBridge {
     }
   }
 
-  /// Updates the visibility, clipped viewport rect, and full layout rect of a
-  /// Linux `GtkOverlay` WebView.
+  /// Updates the visibility, pointer pass-through state, clipped viewport rect,
+  /// and full layout rect of a Linux `GtkOverlay` WebView.
   Future<void> setLinuxGeometry({
     required int controllerId,
     required bool visible,
@@ -293,12 +293,14 @@ final class IoWebViewBridge extends WebViewPlatformBridge {
     int? fullY,
     int? fullWidth,
     int? fullHeight,
+    bool passThrough = false,
   }) async {
     _ensureHandlerRegistered();
     try {
       await channel.invokeMethod<void>('setGeometry', <String, Object?>{
         'controllerId': controllerId,
         'visible': visible,
+        'passThrough': passThrough,
         'x': x,
         'y': y,
         'width': width,
@@ -700,9 +702,28 @@ final class IoWebViewBridge extends WebViewPlatformBridge {
   }
 }
 
+final Set<_LinuxWebViewHostState> _mountedLinuxHosts =
+    <_LinuxWebViewHostState>{};
+bool _linuxPersistentCallbackInstalled = false;
+
+void _ensureLinuxPersistentCallback() {
+  if (_linuxPersistentCallbackInstalled) {
+    return;
+  }
+  _linuxPersistentCallbackInstalled = true;
+  SchedulerBinding.instance.addPersistentFrameCallback((_) {
+    if (_mountedLinuxHosts.isEmpty) {
+      return;
+    }
+    for (final host in _mountedLinuxHosts.toList(growable: false)) {
+      host._syncAfterFrame();
+    }
+  });
+}
+
 /// Event-driven Linux `GtkOverlay` host widget that synchronizes visibility,
-/// `IndexedStack` / `Offstage` / modal occlusion, and clipped viewport geometry
-/// without idle `addPostFrameCallback` polling loops.
+/// `IndexedStack` / `Offstage` / popup & modal occlusion, Flutter drag
+/// pass-through, and clipped viewport geometry without idle frame polling.
 class _LinuxWebViewHost extends StatefulWidget {
   const _LinuxWebViewHost({
     required this.bridge,
@@ -720,6 +741,7 @@ class _LinuxWebViewHost extends StatefulWidget {
 class _LinuxWebViewHostState extends State<_LinuxWebViewHost>
     with WidgetsBindingObserver {
   final GlobalKey _surfaceKey = GlobalKey();
+  final Set<int> _activeFlutterPointers = <int>{};
   ScrollPosition? _scrollPosition;
   Animation<double>? _secondaryRouteAnimation;
   bool _syncScheduled = false;
@@ -727,9 +749,43 @@ class _LinuxWebViewHostState extends State<_LinuxWebViewHost>
   @override
   void initState() {
     super.initState();
+    _ensureLinuxPersistentCallback();
+    _mountedLinuxHosts.add(this);
     WidgetsBinding.instance.addObserver(this);
     FocusManager.instance.addListener(_scheduleGeometrySync);
+    GestureBinding.instance.pointerRouter.addGlobalRoute(
+      _handleGlobalPointerEvent,
+    );
     unawaited(widget.bridge.createLinuxView(widget.params));
+  }
+
+  void _handleGlobalPointerEvent(PointerEvent event) {
+    final wasGrabbing = _activeFlutterPointers.isNotEmpty;
+    if (event is PointerDownEvent) {
+      _activeFlutterPointers.add(event.pointer);
+    } else if (event is PointerUpEvent || event is PointerCancelEvent) {
+      _activeFlutterPointers.remove(event.pointer);
+    } else {
+      return;
+    }
+    final isGrabbing = _activeFlutterPointers.isNotEmpty;
+    if (wasGrabbing == isGrabbing) {
+      return;
+    }
+    final renderObject = _surfaceKey.currentContext?.findRenderObject();
+    if (renderObject is _RenderLinuxWebViewSurface) {
+      renderObject.flutterPointerGrabActive = isGrabbing;
+    }
+  }
+
+  void _syncAfterFrame() {
+    if (!mounted) {
+      return;
+    }
+    final renderObject = _surfaceKey.currentContext?.findRenderObject();
+    if (renderObject is _RenderLinuxWebViewSurface) {
+      renderObject.syncGeometryNow();
+    }
   }
 
   @override
@@ -781,18 +837,13 @@ class _LinuxWebViewHostState extends State<_LinuxWebViewHost>
     _syncScheduled = true;
     SchedulerBinding.instance.addPostFrameCallback((_) {
       _syncScheduled = false;
-      if (!mounted) {
-        return;
-      }
-      final renderObject = _surfaceKey.currentContext?.findRenderObject();
-      if (renderObject is _RenderLinuxWebViewSurface) {
-        renderObject.syncGeometryNow();
-      }
+      _syncAfterFrame();
     });
   }
 
   @override
   void deactivate() {
+    _activeFlutterPointers.clear();
     final renderObject = _surfaceKey.currentContext?.findRenderObject();
     if (renderObject is _RenderLinuxWebViewSurface) {
       renderObject.hideImmediately();
@@ -813,6 +864,11 @@ class _LinuxWebViewHostState extends State<_LinuxWebViewHost>
 
   @override
   void dispose() {
+    _mountedLinuxHosts.remove(this);
+    _activeFlutterPointers.clear();
+    GestureBinding.instance.pointerRouter.removeGlobalRoute(
+      _handleGlobalPointerEvent,
+    );
     _scrollPosition?.removeListener(_scheduleGeometrySync);
     _secondaryRouteAnimation?.removeListener(_scheduleGeometrySync);
     FocusManager.instance.removeListener(_scheduleGeometrySync);
@@ -843,6 +899,7 @@ class _LinuxWebViewHostState extends State<_LinuxWebViewHost>
       bridge: widget.bridge,
       controllerId: widget.params.controllerId,
       subtreeVisible: subtreeVisible,
+      flutterPointerGrabActive: _activeFlutterPointers.isNotEmpty,
       viewId: viewId,
       onPaintNeedsSync: _scheduleGeometrySync,
       child: ColoredBox(
@@ -858,6 +915,7 @@ class _LinuxWebViewSurface extends SingleChildRenderObjectWidget {
     required this.bridge,
     required this.controllerId,
     required this.subtreeVisible,
+    required this.flutterPointerGrabActive,
     required this.viewId,
     required this.onPaintNeedsSync,
     super.key,
@@ -867,6 +925,7 @@ class _LinuxWebViewSurface extends SingleChildRenderObjectWidget {
   final IoWebViewBridge bridge;
   final int controllerId;
   final bool subtreeVisible;
+  final bool flutterPointerGrabActive;
   final int? viewId;
   final VoidCallback onPaintNeedsSync;
 
@@ -876,6 +935,7 @@ class _LinuxWebViewSurface extends SingleChildRenderObjectWidget {
       bridge: bridge,
       controllerId: controllerId,
       subtreeVisible: subtreeVisible,
+      flutterPointerGrabActive: flutterPointerGrabActive,
       viewId: viewId,
       onPaintNeedsSync: onPaintNeedsSync,
     );
@@ -891,6 +951,7 @@ class _LinuxWebViewSurface extends SingleChildRenderObjectWidget {
       ..controllerId = controllerId
       ..viewId = viewId
       ..onPaintNeedsSync = onPaintNeedsSync
+      ..flutterPointerGrabActive = flutterPointerGrabActive
       ..subtreeVisible = subtreeVisible;
   }
 }
@@ -899,6 +960,7 @@ class _LinuxWebViewSurface extends SingleChildRenderObjectWidget {
 class _LinuxGeometrySnapshot {
   const _LinuxGeometrySnapshot({
     required this.visible,
+    required this.passThrough,
     required this.x,
     required this.y,
     required this.width,
@@ -911,6 +973,7 @@ class _LinuxGeometrySnapshot {
 
   static const _LinuxGeometrySnapshot hidden = _LinuxGeometrySnapshot(
     visible: false,
+    passThrough: true,
     x: 0,
     y: 0,
     width: 0,
@@ -922,6 +985,7 @@ class _LinuxGeometrySnapshot {
   );
 
   final bool visible;
+  final bool passThrough;
   final int x;
   final int y;
   final int width;
@@ -935,6 +999,7 @@ class _LinuxGeometrySnapshot {
   bool operator ==(Object other) {
     return other is _LinuxGeometrySnapshot &&
         other.visible == visible &&
+        other.passThrough == passThrough &&
         other.x == x &&
         other.y == y &&
         other.width == width &&
@@ -948,6 +1013,7 @@ class _LinuxGeometrySnapshot {
   @override
   int get hashCode => Object.hash(
     visible,
+    passThrough,
     x,
     y,
     width,
@@ -964,17 +1030,20 @@ class _RenderLinuxWebViewSurface extends RenderProxyBox {
     required IoWebViewBridge bridge,
     required int controllerId,
     required bool subtreeVisible,
+    required bool flutterPointerGrabActive,
     required int? viewId,
     required VoidCallback onPaintNeedsSync,
   }) : _bridge = bridge,
        _controllerId = controllerId,
        _subtreeVisible = subtreeVisible,
+       _flutterPointerGrabActive = flutterPointerGrabActive,
        _viewId = viewId,
        _onPaintNeedsSync = onPaintNeedsSync;
 
   IoWebViewBridge _bridge;
   int _controllerId;
   bool _subtreeVisible;
+  bool _flutterPointerGrabActive;
   int? _viewId;
   VoidCallback _onPaintNeedsSync;
   _LinuxGeometrySnapshot? _lastSent;
@@ -998,6 +1067,14 @@ class _RenderLinuxWebViewSurface extends RenderProxyBox {
     _controllerId = value;
     _lastSent = null;
     markNeedsPaint();
+  }
+
+  set flutterPointerGrabActive(bool value) {
+    if (_flutterPointerGrabActive == value) {
+      return;
+    }
+    _flutterPointerGrabActive = value;
+    syncGeometryNow();
   }
 
   set subtreeVisible(bool value) {
@@ -1025,40 +1102,55 @@ class _RenderLinuxWebViewSurface extends RenderProxyBox {
     _emitGeometry(snapshot);
   }
 
-  bool _isFullyOccludedInView(Rect visibleRect) {
+  /// Returns `true` when any interior sample point of [visibleRect] is covered
+  /// by a hit-absorbing Flutter widget above this surface (e.g. modal barrier,
+  /// dropdown menu, popup menu, floating dialog, or in-stack overlay).
+  bool _isOccludedInView(Rect visibleRect) {
     final targetViewId = _viewId;
     if (targetViewId == null || debugNeedsLayout) {
       return false;
     }
-    final samplePoints = <Offset>[
-      visibleRect.center,
-      Offset(
-        visibleRect.left + visibleRect.width * 0.2,
-        visibleRect.top + visibleRect.height * 0.2,
-      ),
-      Offset(
-        visibleRect.left + visibleRect.width * 0.8,
-        visibleRect.top + visibleRect.height * 0.2,
-      ),
-      Offset(
-        visibleRect.left + visibleRect.width * 0.2,
-        visibleRect.top + visibleRect.height * 0.8,
-      ),
-      Offset(
-        visibleRect.left + visibleRect.width * 0.8,
-        visibleRect.top + visibleRect.height * 0.8,
-      ),
-    ];
+    final List<Offset> samplePoints;
+    if (visibleRect.width < 24.0 || visibleRect.height < 24.0) {
+      samplePoints = <Offset>[visibleRect.center];
+    } else {
+      final l = visibleRect.left;
+      final t = visibleRect.top;
+      final w = visibleRect.width;
+      final h = visibleRect.height;
+      samplePoints = <Offset>[
+        visibleRect.center,
+        Offset(l + w * 0.2, t + h * 0.2),
+        Offset(l + w * 0.5, t + h * 0.2),
+        Offset(l + w * 0.8, t + h * 0.2),
+        Offset(l + w * 0.2, t + h * 0.5),
+        Offset(l + w * 0.8, t + h * 0.5),
+        Offset(l + w * 0.2, t + h * 0.8),
+        Offset(l + w * 0.5, t + h * 0.8),
+        Offset(l + w * 0.8, t + h * 0.8),
+        Offset(l + w * 0.35, t + h * 0.1),
+        Offset(l + w * 0.5, t + h * 0.1),
+        Offset(l + w * 0.65, t + h * 0.1),
+        Offset(l + w * 0.35, t + h * 0.9),
+        Offset(l + w * 0.5, t + h * 0.9),
+        Offset(l + w * 0.65, t + h * 0.9),
+      ];
+    }
     for (final point in samplePoints) {
       final hitResult = BoxHitTestResult();
       RendererBinding.instance.hitTestInView(hitResult, point, targetViewId);
+      var hitSelf = false;
       for (final entry in hitResult.path) {
         if (identical(entry.target, this)) {
-          return false;
+          hitSelf = true;
+          break;
         }
       }
+      if (!hitSelf) {
+        return true;
+      }
     }
-    return true;
+    return false;
   }
 
   _LinuxGeometrySnapshot _computeVisibleGeometry({
@@ -1108,12 +1200,13 @@ class _RenderLinuxWebViewSurface extends RenderProxyBox {
       return _LinuxGeometrySnapshot.hidden;
     }
 
-    if (checkOcclusion && _isFullyOccludedInView(visibleRect)) {
+    if (checkOcclusion && _isOccludedInView(visibleRect)) {
       return _LinuxGeometrySnapshot.hidden;
     }
 
     return _LinuxGeometrySnapshot(
       visible: true,
+      passThrough: _flutterPointerGrabActive,
       x: left,
       y: top,
       width: width,
@@ -1153,6 +1246,7 @@ class _RenderLinuxWebViewSurface extends RenderProxyBox {
       _bridge.setLinuxGeometry(
         controllerId: _controllerId,
         visible: next.visible,
+        passThrough: next.passThrough,
         x: next.x,
         y: next.y,
         width: next.width,

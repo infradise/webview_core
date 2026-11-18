@@ -1,11 +1,14 @@
 #include "include/webview_core/webview_core_plugin.h"
 
 #include <flutter_linux/flutter_linux.h>
+#include <gdk/gdkkeysyms.h>
 #include <gtk/gtk.h>
 #include <webkit2/webkit2.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -14,6 +17,397 @@
 #include <vector>
 
 namespace {
+
+bool IsWaylandDisplay() {
+  GdkDisplay* display = gdk_display_get_default();
+  if (display == nullptr) {
+    return false;
+  }
+  const char* type_name = G_OBJECT_TYPE_NAME(display);
+  return type_name != nullptr && g_str_has_prefix(type_name, "GdkWayland");
+}
+
+}  // namespace
+
+// Native viewport container clipping a child WebKitWebView to the visible
+// Flutter rect while preserving its unclipped layout size. On Wayland (where
+// Flutter 3.50+ composites FlView into a wl_subsurface above GtkWindow's main
+// surface), realizing this container as GDK_WINDOW_SUBSURFACE stacks the
+// WebView surface above FlViewRendererSubsurface while keeping pass-through
+// and clipping synchronized with the parent window.
+struct _WebviewClipBox {
+  GtkBin parent_instance;
+  int child_offset_x;
+  int child_offset_y;
+  int child_width;
+  int child_height;
+  bool pass_through;
+  bool is_subsurface;
+  GtkWidget* watched_toplevel;
+  gulong toplevel_map_id;
+  gulong toplevel_destroy_id;
+};
+
+struct _WebviewClipBoxClass {
+  GtkBinClass parent_class;
+};
+
+typedef struct _WebviewClipBox WebviewClipBox;
+typedef struct _WebviewClipBoxClass WebviewClipBoxClass;
+
+GType webview_clip_box_get_type(void);
+
+G_DEFINE_TYPE(WebviewClipBox, webview_clip_box, GTK_TYPE_BIN)
+
+#define WEBVIEW_CLIP_BOX(obj) \
+  (G_TYPE_CHECK_INSTANCE_CAST((obj), webview_clip_box_get_type(), WebviewClipBox))
+#define IS_WEBVIEW_CLIP_BOX(obj) \
+  (G_TYPE_CHECK_INSTANCE_TYPE((obj), webview_clip_box_get_type()))
+
+namespace {
+
+void DisconnectWatchedToplevel(WebviewClipBox* self) {
+  if (self == nullptr || self->watched_toplevel == nullptr) {
+    return;
+  }
+  if (self->toplevel_map_id != 0) {
+    g_signal_handler_disconnect(self->watched_toplevel, self->toplevel_map_id);
+    self->toplevel_map_id = 0;
+  }
+  if (self->toplevel_destroy_id != 0) {
+    g_signal_handler_disconnect(self->watched_toplevel,
+                                self->toplevel_destroy_id);
+    self->toplevel_destroy_id = 0;
+  }
+  self->watched_toplevel = nullptr;
+}
+
+void OnWatchedToplevelMapped(GtkWidget* /*toplevel*/, gpointer user_data) {
+  WebviewClipBox* self = WEBVIEW_CLIP_BOX(user_data);
+  DisconnectWatchedToplevel(self);
+  GtkWidget* widget = GTK_WIDGET(self);
+  if (gtk_widget_get_visible(widget) && !gtk_widget_get_mapped(widget)) {
+    gtk_widget_map(widget);
+  }
+}
+
+void OnWatchedToplevelDestroyed(GtkWidget* /*toplevel*/, gpointer user_data) {
+  WebviewClipBox* self = WEBVIEW_CLIP_BOX(user_data);
+  self->toplevel_map_id = 0;
+  self->toplevel_destroy_id = 0;
+  self->watched_toplevel = nullptr;
+}
+
+void ComputeClipWindowPosition(GtkWidget* widget,
+                               const GtkAllocation* allocation,
+                               bool is_subsurface,
+                               int* out_x,
+                               int* out_y) {
+  int win_x = allocation->x;
+  int win_y = allocation->y;
+  if (is_subsurface) {
+    GtkWidget* toplevel = gtk_widget_get_toplevel(widget);
+    GdkWindow* top_win =
+        (toplevel != nullptr && gtk_widget_is_toplevel(toplevel))
+            ? gtk_widget_get_window(toplevel)
+            : nullptr;
+    GdkWindow* cur = gtk_widget_get_parent_window(widget);
+    while (cur != nullptr && top_win != nullptr && cur != top_win) {
+      int dx = 0;
+      int dy = 0;
+      gdk_window_get_position(cur, &dx, &dy);
+      win_x += dx;
+      win_y += dy;
+      cur = gdk_window_get_parent(cur);
+    }
+  }
+  *out_x = win_x;
+  *out_y = win_y;
+}
+
+}  // namespace
+
+static void webview_clip_box_get_preferred_width(GtkWidget* /*widget*/,
+                                                 gint* minimum,
+                                                 gint* natural) {
+  if (minimum != nullptr) {
+    *minimum = 0;
+  }
+  if (natural != nullptr) {
+    *natural = 0;
+  }
+}
+
+static void webview_clip_box_get_preferred_height(GtkWidget* /*widget*/,
+                                                  gint* minimum,
+                                                  gint* natural) {
+  if (minimum != nullptr) {
+    *minimum = 0;
+  }
+  if (natural != nullptr) {
+    *natural = 0;
+  }
+}
+
+static void webview_clip_box_realize(GtkWidget* widget) {
+  WebviewClipBox* self = WEBVIEW_CLIP_BOX(widget);
+  GtkAllocation allocation;
+  gtk_widget_get_allocation(widget, &allocation);
+
+  GtkWidget* toplevel = gtk_widget_get_toplevel(widget);
+  GdkWindow* top_win =
+      (toplevel != nullptr && gtk_widget_is_toplevel(toplevel))
+          ? gtk_widget_get_window(toplevel)
+          : nullptr;
+
+  self->is_subsurface = IsWaylandDisplay() && top_win != nullptr;
+  GdkWindow* parent_window =
+      self->is_subsurface ? top_win : gtk_widget_get_parent_window(widget);
+
+  int win_x = allocation.x;
+  int win_y = allocation.y;
+  ComputeClipWindowPosition(widget, &allocation, self->is_subsurface, &win_x,
+                            &win_y);
+
+  GdkWindowAttr attributes;
+  std::memset(&attributes, 0, sizeof(attributes));
+  attributes.window_type =
+      self->is_subsurface ? GDK_WINDOW_SUBSURFACE : GDK_WINDOW_CHILD;
+  attributes.x = win_x;
+  attributes.y = win_y;
+  attributes.width = std::max(1, allocation.width);
+  attributes.height = std::max(1, allocation.height);
+  attributes.wclass = GDK_INPUT_OUTPUT;
+  attributes.visual = gtk_widget_get_visual(widget);
+  attributes.event_mask =
+      gtk_widget_get_events(widget) | GDK_EXPOSURE_MASK | GDK_STRUCTURE_MASK;
+
+  const gint attributes_mask = GDK_WA_X | GDK_WA_Y | GDK_WA_VISUAL;
+  GdkWindow* window =
+      gdk_window_new(parent_window, &attributes, attributes_mask);
+  if (self->is_subsurface && parent_window != nullptr) {
+    gdk_window_set_transient_for(window, parent_window);
+  }
+  gtk_widget_set_window(widget, window);
+  gtk_widget_register_window(widget, window);
+  gtk_widget_set_realized(widget, TRUE);
+
+  gdk_window_set_pass_through(window, self->pass_through ? TRUE : FALSE);
+
+  GtkWidget* child = gtk_bin_get_child(GTK_BIN(widget));
+  if (child != nullptr) {
+    gtk_widget_set_parent_window(child, window);
+  }
+}
+
+static void webview_clip_box_unrealize(GtkWidget* widget) {
+  WebviewClipBox* self = WEBVIEW_CLIP_BOX(widget);
+  DisconnectWatchedToplevel(self);
+  GTK_WIDGET_CLASS(webview_clip_box_parent_class)->unrealize(widget);
+}
+
+static void webview_clip_box_map(GtkWidget* widget) {
+  WebviewClipBox* self = WEBVIEW_CLIP_BOX(widget);
+  if (self->is_subsurface) {
+    GtkWidget* toplevel = gtk_widget_get_toplevel(widget);
+    if (toplevel != nullptr && gtk_widget_is_toplevel(toplevel) &&
+        !gtk_widget_get_mapped(toplevel)) {
+      if (self->watched_toplevel != toplevel) {
+        DisconnectWatchedToplevel(self);
+        self->watched_toplevel = toplevel;
+        self->toplevel_map_id = g_signal_connect(
+            toplevel, "map", G_CALLBACK(OnWatchedToplevelMapped), self);
+        self->toplevel_destroy_id = g_signal_connect(
+            toplevel, "destroy", G_CALLBACK(OnWatchedToplevelDestroyed), self);
+      }
+      return;
+    }
+  }
+  DisconnectWatchedToplevel(self);
+  GTK_WIDGET_CLASS(webview_clip_box_parent_class)->map(widget);
+  GdkWindow* window = gtk_widget_get_window(widget);
+  if (window != nullptr) {
+    gdk_window_set_pass_through(window, self->pass_through ? TRUE : FALSE);
+  }
+}
+
+static void webview_clip_box_unmap(GtkWidget* widget) {
+  WebviewClipBox* self = WEBVIEW_CLIP_BOX(widget);
+  DisconnectWatchedToplevel(self);
+  GTK_WIDGET_CLASS(webview_clip_box_parent_class)->unmap(widget);
+}
+
+static void webview_clip_box_size_allocate(GtkWidget* widget,
+                                           GtkAllocation* allocation) {
+  WebviewClipBox* self = WEBVIEW_CLIP_BOX(widget);
+  gtk_widget_set_allocation(widget, allocation);
+
+  if (gtk_widget_get_realized(widget)) {
+    GdkWindow* window = gtk_widget_get_window(widget);
+    if (window != nullptr) {
+      int win_x = allocation->x;
+      int win_y = allocation->y;
+      ComputeClipWindowPosition(widget, allocation, self->is_subsurface, &win_x,
+                                &win_y);
+      gdk_window_move_resize(window, win_x, win_y,
+                             std::max(1, allocation->width),
+                             std::max(1, allocation->height));
+    }
+  }
+
+  GtkWidget* child = gtk_bin_get_child(GTK_BIN(widget));
+  if (child != nullptr && gtk_widget_get_visible(child)) {
+    GtkAllocation child_alloc;
+    child_alloc.x = self->child_offset_x;
+    child_alloc.y = self->child_offset_y;
+    child_alloc.width = std::max(1, self->child_width);
+    child_alloc.height = std::max(1, self->child_height);
+    gtk_widget_size_allocate(child, &child_alloc);
+  }
+}
+
+static void webview_clip_box_add(GtkContainer* container, GtkWidget* child) {
+  WebviewClipBox* self = WEBVIEW_CLIP_BOX(container);
+  if (gtk_widget_get_realized(GTK_WIDGET(self))) {
+    GdkWindow* window = gtk_widget_get_window(GTK_WIDGET(self));
+    if (window != nullptr) {
+      gtk_widget_set_parent_window(child, window);
+    }
+  }
+  GTK_CONTAINER_CLASS(webview_clip_box_parent_class)->add(container, child);
+}
+
+static void webview_clip_box_class_init(WebviewClipBoxClass* klass) {
+  GtkWidgetClass* widget_class = GTK_WIDGET_CLASS(klass);
+  widget_class->get_preferred_width = webview_clip_box_get_preferred_width;
+  widget_class->get_preferred_height = webview_clip_box_get_preferred_height;
+  widget_class->realize = webview_clip_box_realize;
+  widget_class->unrealize = webview_clip_box_unrealize;
+  widget_class->map = webview_clip_box_map;
+  widget_class->unmap = webview_clip_box_unmap;
+  widget_class->size_allocate = webview_clip_box_size_allocate;
+
+  GtkContainerClass* container_class = GTK_CONTAINER_CLASS(klass);
+  container_class->add = webview_clip_box_add;
+}
+
+static void webview_clip_box_init(WebviewClipBox* self) {
+  gtk_widget_set_has_window(GTK_WIDGET(self), TRUE);
+  gtk_widget_set_redraw_on_allocate(GTK_WIDGET(self), FALSE);
+  self->child_offset_x = 0;
+  self->child_offset_y = 0;
+  self->child_width = 1;
+  self->child_height = 1;
+  self->pass_through = true;
+  self->is_subsurface = false;
+  self->watched_toplevel = nullptr;
+  self->toplevel_map_id = 0;
+  self->toplevel_destroy_id = 0;
+}
+
+namespace {
+
+GtkWidget* CreateWebviewClipBox(GtkWidget* child) {
+  GtkWidget* box =
+      GTK_WIDGET(g_object_new(webview_clip_box_get_type(), nullptr));
+  if (child != nullptr) {
+    gtk_container_add(GTK_CONTAINER(box), child);
+  }
+  return box;
+}
+
+void UpdateWebviewClipBoxChildLayout(GtkWidget* clip_widget,
+                                     int offset_x,
+                                     int offset_y,
+                                     int full_width,
+                                     int full_height) {
+  if (!IS_WEBVIEW_CLIP_BOX(clip_widget)) {
+    return;
+  }
+  WebviewClipBox* self = WEBVIEW_CLIP_BOX(clip_widget);
+  const int safe_w = std::max(1, full_width);
+  const int safe_h = std::max(1, full_height);
+  if (self->child_offset_x == offset_x && self->child_offset_y == offset_y &&
+      self->child_width == safe_w && self->child_height == safe_h) {
+    return;
+  }
+  self->child_offset_x = offset_x;
+  self->child_offset_y = offset_y;
+  self->child_width = safe_w;
+  self->child_height = safe_h;
+  gtk_widget_queue_allocate(clip_widget);
+}
+
+void SetWebviewClipBoxPassThrough(GtkOverlay* overlay,
+                                  GtkWidget* clip_widget,
+                                  bool pass_through) {
+  if (overlay != nullptr && clip_widget != nullptr &&
+      gtk_widget_get_parent(clip_widget) == GTK_WIDGET(overlay)) {
+    gtk_overlay_set_overlay_pass_through(overlay, clip_widget,
+                                         pass_through ? TRUE : FALSE);
+  }
+  if (IS_WEBVIEW_CLIP_BOX(clip_widget)) {
+    WebviewClipBox* self = WEBVIEW_CLIP_BOX(clip_widget);
+    self->pass_through = pass_through;
+    if (gtk_widget_get_realized(clip_widget)) {
+      GdkWindow* window = gtk_widget_get_window(clip_widget);
+      if (window != nullptr) {
+        gdk_window_set_pass_through(window, pass_through ? TRUE : FALSE);
+      }
+    }
+  }
+}
+
+void SyncWebviewClipBoxWindowGeometry(GtkWidget* clip_widget) {
+  if (!IS_WEBVIEW_CLIP_BOX(clip_widget) ||
+      !gtk_widget_get_realized(clip_widget)) {
+    return;
+  }
+  WebviewClipBox* self = WEBVIEW_CLIP_BOX(clip_widget);
+  GdkWindow* window = gtk_widget_get_window(clip_widget);
+  if (window == nullptr) {
+    return;
+  }
+  GtkAllocation allocation;
+  gtk_widget_get_allocation(clip_widget, &allocation);
+  int win_x = allocation.x;
+  int win_y = allocation.y;
+  ComputeClipWindowPosition(clip_widget, &allocation, self->is_subsurface,
+                            &win_x, &win_y);
+  gdk_window_move_resize(window, win_x, win_y, std::max(1, allocation.width),
+                         std::max(1, allocation.height));
+}
+
+void DismissTransientWebViewPopupsAndGrabs(GtkWidget* clip_container,
+                                           GtkWidget* webview) {
+  if (webview != nullptr) {
+    GList* attached = gtk_menu_get_for_attach_widget(webview);
+    std::vector<GtkMenu*> menus;
+    for (GList* l = attached; l != nullptr; l = l->next) {
+      if (GTK_IS_MENU(l->data)) {
+        menus.push_back(GTK_MENU(l->data));
+      }
+    }
+    for (size_t i = 0; i < menus.size(); ++i) {
+      if (gtk_widget_get_visible(GTK_WIDGET(menus[i]))) {
+        gtk_menu_popdown(menus[i]);
+      }
+    }
+  }
+  GtkWidget* grabbed = gtk_grab_get_current();
+  if (grabbed != nullptr) {
+    const bool in_clip =
+        clip_container != nullptr &&
+        (grabbed == clip_container ||
+         gtk_widget_is_ancestor(grabbed, clip_container));
+    const bool in_webview =
+        webview != nullptr &&
+        (grabbed == webview || gtk_widget_is_ancestor(grabbed, webview));
+    if (in_clip || in_webview) {
+      gtk_grab_remove(grabbed);
+    }
+  }
+}
 
 std::string EscapeJsonString(const std::string& input) {
   std::string out;
@@ -132,10 +526,42 @@ struct PluginState {
   FlPluginRegistrar* registrar = nullptr;
   FlMethodChannel* channel = nullptr;
   GtkOverlay* overlay = nullptr;
+  GtkWidget* flutter_event_box = nullptr;
+  GtkWidget* tracked_fl_view = nullptr;
   gulong child_pos_handler_id = 0;
+  gulong overlay_size_alloc_id = 0;
   gulong overlay_destroy_id = 0;
+  gulong event_box_press_id = 0;
+  gulong event_box_destroy_id = 0;
+  gulong fl_view_press_id = 0;
+  gulong fl_view_destroy_id = 0;
   std::map<int64_t, std::unique_ptr<LinuxWebViewInstance>> instances;
 };
+
+void RestoreFlViewFocusIfNeeded(PluginState* state, GtkWidget* inst_root) {
+  if (state == nullptr || state->registrar == nullptr) {
+    return;
+  }
+  FlView* fl_view = fl_plugin_registrar_get_view(state->registrar);
+  if (fl_view == nullptr) {
+    return;
+  }
+  GtkWidget* view_widget = GTK_WIDGET(fl_view);
+  if (!gtk_widget_get_visible(view_widget) ||
+      !gtk_widget_get_can_focus(view_widget)) {
+    return;
+  }
+  GtkWidget* toplevel = gtk_widget_get_toplevel(view_widget);
+  if (!GTK_IS_WINDOW(toplevel)) {
+    return;
+  }
+  GtkWidget* focused = gtk_window_get_focus(GTK_WINDOW(toplevel));
+  if (focused == nullptr ||
+      (inst_root != nullptr &&
+       (focused == inst_root || gtk_widget_is_ancestor(focused, inst_root)))) {
+    gtk_widget_grab_focus(view_widget);
+  }
+}
 
 struct ChannelCallbackData {
   PluginState* state = nullptr;
@@ -160,6 +586,7 @@ struct LinuxWebViewInstance {
   GtkWidget* webview = nullptr;
   WebKitUserContentManager* ucm = nullptr;
   bool visible = false;
+  bool pass_through = true;
   int x = 0;
   int y = 0;
   int width = 0;
@@ -170,6 +597,11 @@ struct LinuxWebViewInstance {
   int full_height = 0;
   bool has_navigation_decision = false;
   bool zoom_enabled = true;
+  bool loaded_from_html_string = false;
+  bool in_inline_html_load = false;
+  bool has_last_base_url = false;
+  std::string last_html;
+  std::string last_base_url;
   std::string default_user_agent;
   std::map<std::string, gulong> channel_signal_ids;
   std::vector<std::unique_ptr<ChannelCallbackData>> channel_datas;
@@ -179,6 +611,7 @@ struct LinuxWebViewInstance {
   gulong notify_progress_id = 0;
   gulong decide_policy_id = 0;
   gulong create_id = 0;
+  gulong key_press_id = 0;
   gulong webview_destroy_id = 0;
   gulong clip_destroy_id = 0;
   bool destroyed = false;
@@ -190,6 +623,9 @@ struct LinuxWebViewInstance {
       return;
     }
     destroyed = true;
+    DismissTransientWebViewPopupsAndGrabs(clip_container, webview);
+    RestoreFlViewFocusIfNeeded(state, clip_container != nullptr ? clip_container
+                                                                : webview);
     if (ucm != nullptr) {
       for (std::map<std::string, gulong>::iterator it =
                channel_signal_ids.begin();
@@ -229,6 +665,10 @@ struct LinuxWebViewInstance {
         g_signal_handler_disconnect(webview, create_id);
         create_id = 0;
       }
+      if (key_press_id != 0) {
+        g_signal_handler_disconnect(webview, key_press_id);
+        key_press_id = 0;
+      }
       if (webview_destroy_id != 0) {
         g_signal_handler_disconnect(webview, webview_destroy_id);
         webview_destroy_id = 0;
@@ -259,6 +699,8 @@ struct LinuxWebViewInstance {
       }
       clip_container = nullptr;
     }
+    last_html.clear();
+    last_base_url.clear();
     channel_datas.clear();
   }
 };
@@ -274,6 +716,7 @@ void OnWebViewDestroyed(GtkWidget* /*widget*/, gpointer user_data) {
   inst->notify_progress_id = 0;
   inst->decide_policy_id = 0;
   inst->create_id = 0;
+  inst->key_press_id = 0;
   inst->webview_destroy_id = 0;
   inst->webview = nullptr;
 }
@@ -293,8 +736,122 @@ void OnOverlayDestroyed(GtkWidget* /*widget*/, gpointer user_data) {
     return;
   }
   state->child_pos_handler_id = 0;
+  state->overlay_size_alloc_id = 0;
   state->overlay_destroy_id = 0;
   state->overlay = nullptr;
+}
+
+void OnFlutterEventBoxDestroyed(GtkWidget* /*widget*/, gpointer user_data) {
+  PluginState* state = static_cast<PluginState*>(user_data);
+  if (state == nullptr) {
+    return;
+  }
+  state->event_box_press_id = 0;
+  state->event_box_destroy_id = 0;
+  state->flutter_event_box = nullptr;
+}
+
+void OnTrackedFlViewDestroyed(GtkWidget* /*widget*/, gpointer user_data) {
+  PluginState* state = static_cast<PluginState*>(user_data);
+  if (state == nullptr) {
+    return;
+  }
+  state->fl_view_press_id = 0;
+  state->fl_view_destroy_id = 0;
+  state->tracked_fl_view = nullptr;
+}
+
+// FlView registers its own "button-press-event" handler on the internal
+// GtkEventBox during fl_view_init and returns TRUE (GDK_EVENT_STOP) without
+// calling gtk_widget_grab_focus(fl_view), so a later "button-press-event"
+// listener would never be reached. Connecting to "event" runs prior to
+// "button-press-event", restores GTK focus to FlView on mouse/touch press, and
+// returns FALSE so FlView still processes the pointer event normally.
+gboolean OnFlutterSurfaceEvent(GtkWidget* /*widget*/,
+                               GdkEvent* event,
+                               gpointer user_data) {
+  if (event == nullptr) {
+    return FALSE;
+  }
+  const GdkEventType type = event->type;
+  if (type != GDK_BUTTON_PRESS && type != GDK_2BUTTON_PRESS &&
+      type != GDK_3BUTTON_PRESS && type != GDK_TOUCH_BEGIN) {
+    return FALSE;
+  }
+  PluginState* state = static_cast<PluginState*>(user_data);
+  if (state != nullptr && state->registrar != nullptr) {
+    FlView* fl_view = fl_plugin_registrar_get_view(state->registrar);
+    if (fl_view != nullptr) {
+      GtkWidget* view_widget = GTK_WIDGET(fl_view);
+      if (gtk_widget_get_can_focus(view_widget) &&
+          (!gtk_widget_is_focus(view_widget) ||
+           !gtk_widget_has_focus(view_widget))) {
+        gtk_widget_grab_focus(view_widget);
+      }
+    }
+  }
+  return FALSE;
+}
+
+GtkWidget* FindFirstEventBox(GtkWidget* root) {
+  if (root == nullptr) {
+    return nullptr;
+  }
+  if (GTK_IS_EVENT_BOX(root)) {
+    return root;
+  }
+  if (!GTK_IS_CONTAINER(root)) {
+    return nullptr;
+  }
+  GList* children = gtk_container_get_children(GTK_CONTAINER(root));
+  GtkWidget* found = nullptr;
+  for (GList* l = children; l != nullptr && found == nullptr; l = l->next) {
+    found = FindFirstEventBox(GTK_WIDGET(l->data));
+  }
+  g_list_free(children);
+  return found;
+}
+
+void EnsureFlutterFocusHooks(PluginState* state, GtkWidget* view_widget) {
+  if (state == nullptr || view_widget == nullptr) {
+    return;
+  }
+  if (state->tracked_fl_view != view_widget) {
+    if (state->tracked_fl_view != nullptr) {
+      if (state->fl_view_press_id != 0) {
+        g_signal_handler_disconnect(state->tracked_fl_view,
+                                    state->fl_view_press_id);
+      }
+      if (state->fl_view_destroy_id != 0) {
+        g_signal_handler_disconnect(state->tracked_fl_view,
+                                    state->fl_view_destroy_id);
+      }
+    }
+    state->tracked_fl_view = view_widget;
+    state->fl_view_press_id = g_signal_connect(
+        view_widget, "event", G_CALLBACK(OnFlutterSurfaceEvent), state);
+    state->fl_view_destroy_id = g_signal_connect(
+        view_widget, "destroy", G_CALLBACK(OnTrackedFlViewDestroyed), state);
+  }
+
+  GtkWidget* event_box = FindFirstEventBox(view_widget);
+  if (event_box != nullptr && state->flutter_event_box != event_box) {
+    if (state->flutter_event_box != nullptr) {
+      if (state->event_box_press_id != 0) {
+        g_signal_handler_disconnect(state->flutter_event_box,
+                                    state->event_box_press_id);
+      }
+      if (state->event_box_destroy_id != 0) {
+        g_signal_handler_disconnect(state->flutter_event_box,
+                                    state->event_box_destroy_id);
+      }
+    }
+    state->flutter_event_box = event_box;
+    state->event_box_press_id = g_signal_connect(
+        event_box, "event", G_CALLBACK(OnFlutterSurfaceEvent), state);
+    state->event_box_destroy_id = g_signal_connect(
+        event_box, "destroy", G_CALLBACK(OnFlutterEventBoxDestroyed), state);
+  }
 }
 
 void SendChannelEvent(PluginState* state, const char* method, FlValue* args) {
@@ -334,42 +891,154 @@ gboolean OnOverlayGetChildPosition(GtkOverlay* /*overlay*/,
   return FALSE;
 }
 
+void OnOverlaySizeAllocate(GtkWidget* /*overlay*/,
+                           GtkAllocation* /*allocation*/,
+                           gpointer user_data) {
+  PluginState* state = static_cast<PluginState*>(user_data);
+  if (state == nullptr) {
+    return;
+  }
+  for (std::map<int64_t, std::unique_ptr<LinuxWebViewInstance>>::iterator it =
+           state->instances.begin();
+       it != state->instances.end(); ++it) {
+    LinuxWebViewInstance* inst = it->second.get();
+    if (inst != nullptr && inst->visible && inst->clip_container != nullptr) {
+      SyncWebviewClipBoxWindowGeometry(inst->clip_container);
+    }
+  }
+}
+
 GtkOverlay* EnsureOverlay(PluginState* state) {
   if (state == nullptr || state->registrar == nullptr) {
     return nullptr;
-  }
-  if (state->overlay != nullptr) {
-    return state->overlay;
   }
   FlView* fl_view = fl_plugin_registrar_get_view(state->registrar);
   if (fl_view == nullptr) {
     return nullptr;
   }
   GtkWidget* view_widget = GTK_WIDGET(fl_view);
-  GtkWidget* parent = gtk_widget_get_parent(view_widget);
-  if (parent == nullptr) {
-    return nullptr;
+  EnsureFlutterFocusHooks(state, view_widget);
+
+  if (state->overlay != nullptr) {
+    return state->overlay;
   }
 
-  if (GTK_IS_OVERLAY(parent)) {
-    state->overlay = GTK_OVERLAY(parent);
-  } else {
-    GtkWidget* overlay_widget = gtk_overlay_new();
-    gtk_widget_show(overlay_widget);
-    g_object_ref(view_widget);
-    gtk_container_remove(GTK_CONTAINER(parent), view_widget);
-    gtk_container_add(GTK_CONTAINER(overlay_widget), view_widget);
-    gtk_container_add(GTK_CONTAINER(parent), overlay_widget);
-    g_object_unref(view_widget);
-    state->overlay = GTK_OVERLAY(overlay_widget);
+  const bool view_had_focus = gtk_widget_has_focus(view_widget) != FALSE;
+
+  // In Flutter 3.x / 3.50+, FlView inherits from GtkBox and is realized prior
+  // to plugin registration. Removing FlView from its parent GtkWindow triggers
+  // fl_view_unrealize, which tears down the engine view and stalls the Dart UI
+  // isolate. Instead, pack GtkOverlay inside FlView and reparent FlView's
+  // internal GtkEventBox into the already-realized GtkOverlay so neither FlView
+  // nor its renderer surface is ever unrealized.
+  if (GTK_IS_BOX(view_widget)) {
+    GList* children = gtk_container_get_children(GTK_CONTAINER(view_widget));
+    GtkWidget* first_child =
+        children != nullptr ? GTK_WIDGET(children->data) : nullptr;
+    g_list_free(children);
+
+    if (first_child != nullptr && GTK_IS_OVERLAY(first_child)) {
+      state->overlay = GTK_OVERLAY(first_child);
+    } else if (first_child != nullptr) {
+      gboolean expand = TRUE;
+      gboolean fill = TRUE;
+      guint padding = 0;
+      GtkPackType pack_type = GTK_PACK_START;
+      gtk_box_query_child_packing(GTK_BOX(view_widget), first_child, &expand,
+                                  &fill, &padding, &pack_type);
+
+      GtkWidget* overlay_widget = gtk_overlay_new();
+      gtk_widget_set_hexpand(overlay_widget, TRUE);
+      gtk_widget_set_vexpand(overlay_widget, TRUE);
+      gtk_box_pack_start(GTK_BOX(view_widget), overlay_widget, expand, fill,
+                         padding);
+      gtk_box_set_child_packing(GTK_BOX(view_widget), overlay_widget, expand,
+                                fill, padding, pack_type);
+      gtk_box_reorder_child(GTK_BOX(view_widget), overlay_widget, 0);
+      gtk_widget_show(overlay_widget);
+
+      gtk_widget_set_hexpand(first_child, TRUE);
+      gtk_widget_set_vexpand(first_child, TRUE);
+      G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+      gtk_widget_reparent(first_child, overlay_widget);
+      G_GNUC_END_IGNORE_DEPRECATIONS
+
+      state->overlay = GTK_OVERLAY(overlay_widget);
+    }
+  }
+
+  if (state->overlay == nullptr) {
+    GtkWidget* parent = gtk_widget_get_parent(view_widget);
+    if (parent == nullptr) {
+      return nullptr;
+    }
+    if (GTK_IS_OVERLAY(parent)) {
+      state->overlay = GTK_OVERLAY(parent);
+    } else {
+      gboolean expand = TRUE;
+      gboolean fill = TRUE;
+      guint padding = 0;
+      GtkPackType pack_type = GTK_PACK_START;
+      gint position = 0;
+      const bool parent_is_box = GTK_IS_BOX(parent) != FALSE;
+      if (parent_is_box) {
+        gtk_box_query_child_packing(GTK_BOX(parent), view_widget, &expand,
+                                    &fill, &padding, &pack_type);
+        GList* siblings = gtk_container_get_children(GTK_CONTAINER(parent));
+        position = g_list_index(siblings, view_widget);
+        g_list_free(siblings);
+      }
+
+      GtkWidget* overlay_widget = gtk_overlay_new();
+      gtk_widget_set_hexpand(overlay_widget, TRUE);
+      gtk_widget_set_vexpand(overlay_widget, TRUE);
+      gtk_widget_show(overlay_widget);
+      g_object_ref(view_widget);
+      gtk_container_remove(GTK_CONTAINER(parent), view_widget);
+      gtk_container_add(GTK_CONTAINER(overlay_widget), view_widget);
+      gtk_container_add(GTK_CONTAINER(parent), overlay_widget);
+      if (parent_is_box) {
+        gtk_box_set_child_packing(GTK_BOX(parent), overlay_widget, expand, fill,
+                                  padding, pack_type);
+        if (position >= 0) {
+          gtk_box_reorder_child(GTK_BOX(parent), overlay_widget, position);
+        }
+      }
+      g_object_unref(view_widget);
+      state->overlay = GTK_OVERLAY(overlay_widget);
+    }
+  }
+
+  if (view_had_focus && !gtk_widget_has_focus(view_widget)) {
+    gtk_widget_grab_focus(view_widget);
   }
 
   state->child_pos_handler_id = g_signal_connect(
       state->overlay, "get-child-position",
       G_CALLBACK(OnOverlayGetChildPosition), state);
+  state->overlay_size_alloc_id = g_signal_connect(
+      state->overlay, "size-allocate",
+      G_CALLBACK(OnOverlaySizeAllocate), state);
   state->overlay_destroy_id = g_signal_connect(
       state->overlay, "destroy", G_CALLBACK(OnOverlayDestroyed), state);
   return state->overlay;
+}
+
+void LoadHtmlOnWebView(LinuxWebViewInstance* inst,
+                       const std::string& html,
+                       bool has_base,
+                       const std::string& base_url) {
+  if (inst == nullptr || inst->webview == nullptr) {
+    return;
+  }
+  inst->loaded_from_html_string = true;
+  inst->in_inline_html_load = true;
+  inst->last_html = html;
+  inst->has_last_base_url = has_base && !base_url.empty();
+  inst->last_base_url = inst->has_last_base_url ? base_url : std::string();
+  webkit_web_view_load_html(
+      WEBKIT_WEB_VIEW(inst->webview), inst->last_html.c_str(),
+      inst->has_last_base_url ? inst->last_base_url.c_str() : nullptr);
 }
 
 void RebuildUserScripts(LinuxWebViewInstance* inst) {
@@ -500,7 +1169,15 @@ void OnLoadChanged(WebKitWebView* web_view,
                              fl_value_new_int(inst->controller_id));
     fl_value_set_string_take(map, "url", fl_value_new_string(safe_uri));
     SendChannelEvent(inst->state, "onPageStarted", map);
+  } else if (load_event == WEBKIT_LOAD_COMMITTED) {
+    if (!inst->in_inline_html_load) {
+      inst->loaded_from_html_string = false;
+      inst->last_html.clear();
+      inst->last_base_url.clear();
+      inst->has_last_base_url = false;
+    }
   } else if (load_event == WEBKIT_LOAD_FINISHED) {
+    inst->in_inline_html_load = false;
     FlValue* map = fl_value_new_map();
     fl_value_set_string_take(map, "controllerId",
                              fl_value_new_int(inst->controller_id));
@@ -522,6 +1199,7 @@ gboolean OnLoadFailed(WebKitWebView* /*web_view*/,
                       WEBKIT_NETWORK_ERROR_CANCELLED)) {
     return FALSE;
   }
+  inst->in_inline_html_load = false;
   FlValue* map = fl_value_new_map();
   fl_value_set_string_take(map, "controllerId",
                            fl_value_new_int(inst->controller_id));
@@ -611,7 +1289,7 @@ gboolean OnDecidePolicy(WebKitWebView* /*web_view*/,
                         WebKitPolicyDecisionType decision_type,
                         gpointer user_data) {
   LinuxWebViewInstance* inst = static_cast<LinuxWebViewInstance*>(user_data);
-  if (inst == nullptr || inst->destroyed || !inst->has_navigation_decision) {
+  if (inst == nullptr || inst->destroyed) {
     return FALSE;
   }
   if (decision_type != WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION &&
@@ -622,6 +1300,28 @@ gboolean OnDecidePolicy(WebKitWebView* /*web_view*/,
       WEBKIT_NAVIGATION_POLICY_DECISION(decision);
   WebKitNavigationAction* action =
       webkit_navigation_policy_decision_get_navigation_action(nav_decision);
+
+  // When an inline HTML document was loaded with a baseUrl, WebKitGTK's
+  // native Reload (including the right-click context menu item) attempts to
+  // network-fetch baseUrl instead of re-rendering the inline HTML. Intercept
+  // reload actions and replay the stored inline HTML in place.
+  if (decision_type == WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION &&
+      action != nullptr &&
+      webkit_navigation_action_get_navigation_type(action) ==
+          WEBKIT_NAVIGATION_TYPE_RELOAD &&
+      inst->loaded_from_html_string) {
+    webkit_policy_decision_ignore(decision);
+    const std::string html_copy = inst->last_html;
+    const bool has_base = inst->has_last_base_url;
+    const std::string base_copy = inst->last_base_url;
+    LoadHtmlOnWebView(inst, html_copy, has_base, base_copy);
+    return TRUE;
+  }
+
+  if (!inst->has_navigation_decision) {
+    return FALSE;
+  }
+
   WebKitURIRequest* req =
       action != nullptr ? webkit_navigation_action_get_request(action)
                         : nullptr;
@@ -664,9 +1364,44 @@ GtkWidget* OnCreateWebView(WebKitWebView* web_view,
       request != nullptr ? webkit_uri_request_get_uri(request) : nullptr;
   if (uri != nullptr && (g_str_has_prefix(uri, "http://") ||
                          g_str_has_prefix(uri, "https://"))) {
+    inst->loaded_from_html_string = false;
+    inst->in_inline_html_load = false;
+    inst->last_html.clear();
+    inst->last_base_url.clear();
+    inst->has_last_base_url = false;
     webkit_web_view_load_uri(web_view, uri);
   }
   return nullptr;
+}
+
+// Forward function keys (F1-F12) and Super/Meta shortcuts back to FlView so
+// application-level shortcuts keep working while WebKitWebView holds GTK focus.
+gboolean OnWebViewKeyPress(GtkWidget* /*widget*/,
+                           GdkEventKey* event,
+                           gpointer user_data) {
+  LinuxWebViewInstance* inst = static_cast<LinuxWebViewInstance*>(user_data);
+  if (inst == nullptr || inst->destroyed || event == nullptr ||
+      inst->state == nullptr || inst->state->registrar == nullptr) {
+    return FALSE;
+  }
+  const bool is_func_key =
+      event->keyval >= GDK_KEY_F1 && event->keyval <= GDK_KEY_F12;
+  const bool is_super_combo =
+      (event->state & (GDK_SUPER_MASK | GDK_META_MASK)) != 0;
+  if (!is_func_key && !is_super_combo) {
+    return FALSE;
+  }
+  FlView* fl_view = fl_plugin_registrar_get_view(inst->state->registrar);
+  if (fl_view == nullptr) {
+    return FALSE;
+  }
+  GtkWidget* view_widget = GTK_WIDGET(fl_view);
+  if (gtk_widget_get_can_focus(view_widget) &&
+      !gtk_widget_has_focus(view_widget)) {
+    gtk_widget_grab_focus(view_widget);
+  }
+  gtk_widget_event(view_widget, reinterpret_cast<GdkEvent*>(event));
+  return TRUE;
 }
 
 void LoadRequestOnWebView(LinuxWebViewInstance* inst,
@@ -677,6 +1412,12 @@ void LoadRequestOnWebView(LinuxWebViewInstance* inst,
   if (inst == nullptr || inst->webview == nullptr) {
     return;
   }
+  inst->loaded_from_html_string = false;
+  inst->in_inline_html_load = false;
+  inst->last_html.clear();
+  inst->last_base_url.clear();
+  inst->has_last_base_url = false;
+
   std::string upper_method;
   upper_method.reserve(method.size());
   for (size_t i = 0; i < method.size(); ++i) {
@@ -762,6 +1503,7 @@ void LoadRequestOnWebView(LinuxWebViewInstance* inst,
       "}).then(function(r){return r.text();}).then(function(t){"
       "document.open();document.write(t);document.close();});"
       "</script></body></html>";
+  inst->in_inline_html_load = true;
   webkit_web_view_load_html(WEBKIT_WEB_VIEW(inst->webview),
                             bootstrap_html.c_str(), url.c_str());
 }
@@ -965,8 +1707,7 @@ LinuxWebViewInstance* CreateInstance(PluginState* state,
   inst->controller_id = controller_id;
   inst->ucm = webkit_user_content_manager_new();
   inst->webview = webkit_web_view_new_with_user_content_manager(inst->ucm);
-  inst->clip_container = gtk_layout_new(nullptr, nullptr);
-  gtk_layout_put(GTK_LAYOUT(inst->clip_container), inst->webview, 0, 0);
+  inst->clip_container = CreateWebviewClipBox(inst->webview);
   gtk_widget_show(inst->webview);
 
   WebKitSettings* settings =
@@ -1024,6 +1765,9 @@ LinuxWebViewInstance* CreateInstance(PluginState* state,
       inst->webview, "decide-policy", G_CALLBACK(OnDecidePolicy), inst.get());
   inst->create_id = g_signal_connect(inst->webview, "create",
                                      G_CALLBACK(OnCreateWebView), inst.get());
+  inst->key_press_id = g_signal_connect(
+      inst->webview, "key-press-event", G_CALLBACK(OnWebViewKeyPress),
+      inst.get());
   inst->webview_destroy_id = g_signal_connect(
       inst->webview, "destroy", G_CALLBACK(OnWebViewDestroyed), inst.get());
   inst->clip_destroy_id =
@@ -1033,7 +1777,7 @@ LinuxWebViewInstance* CreateInstance(PluginState* state,
   GtkOverlay* overlay = EnsureOverlay(state);
   if (overlay != nullptr) {
     gtk_overlay_add_overlay(overlay, inst->clip_container);
-    gtk_overlay_set_overlay_pass_through(overlay, inst->clip_container, TRUE);
+    SetWebviewClipBoxPassThrough(overlay, inst->clip_container, true);
   }
   gtk_widget_hide(inst->clip_container);
 
@@ -1046,9 +1790,7 @@ LinuxWebViewInstance* CreateInstance(PluginState* state,
     bool has_base = false;
     const std::string base_url =
         GetStringArg(args, "initialBaseUrl", &has_base);
-    webkit_web_view_load_html(
-        WEBKIT_WEB_VIEW(inst->webview), initial_html.c_str(),
-        (has_base && !base_url.empty()) ? base_url.c_str() : nullptr);
+    LoadHtmlOnWebView(inst.get(), initial_html, has_base, base_url);
   } else if (has_url && !initial_url.empty()) {
     const std::string method = GetStringArg(args, "initialMethod");
     LoadRequestOnWebView(inst.get(), initial_url,
@@ -1149,6 +1891,7 @@ static void HandleMethodCall(WebviewCorePlugin* self, FlMethodCall* call) {
 
   if (std::strcmp(method, "setGeometry") == 0) {
     const bool visible = GetBoolArg(args, "visible", false);
+    const bool pass_through = GetBoolArg(args, "passThrough", false);
     int64_t x = 0;
     int64_t y = 0;
     int64_t w = 0;
@@ -1176,6 +1919,7 @@ static void HandleMethodCall(WebviewCorePlugin* self, FlMethodCall* call) {
     inst->full_width = static_cast<int>(full_w > 0 ? full_w : w);
     inst->full_height = static_cast<int>(full_h > 0 ? full_h : h);
     inst->visible = visible && w > 0 && h > 0;
+    inst->pass_through = !inst->visible || pass_through;
 
     GtkOverlay* overlay = EnsureOverlay(state);
     if (overlay != nullptr &&
@@ -1184,11 +1928,11 @@ static void HandleMethodCall(WebviewCorePlugin* self, FlMethodCall* call) {
     }
 
     if (!inst->visible) {
-      if (overlay != nullptr) {
-        gtk_overlay_set_overlay_pass_through(overlay, inst->clip_container,
-                                             TRUE);
-      }
+      DismissTransientWebViewPopupsAndGrabs(inst->clip_container,
+                                            inst->webview);
+      SetWebviewClipBoxPassThrough(overlay, inst->clip_container, true);
       gtk_widget_hide(inst->clip_container);
+      RestoreFlViewFocusIfNeeded(state, inst->clip_container);
       if (state->registrar != nullptr) {
         FlView* fl_view = fl_plugin_registrar_get_view(state->registrar);
         if (fl_view != nullptr) {
@@ -1200,15 +1944,13 @@ static void HandleMethodCall(WebviewCorePlugin* self, FlMethodCall* call) {
       const int target_h = inst->full_height > 0 ? inst->full_height : 1;
       const int offset_x = inst->full_x - inst->x;
       const int offset_y = inst->full_y - inst->y;
-      gtk_layout_set_size(GTK_LAYOUT(inst->clip_container),
-                          static_cast<guint>(target_w),
-                          static_cast<guint>(target_h));
+      UpdateWebviewClipBoxChildLayout(inst->clip_container, offset_x, offset_y,
+                                      target_w, target_h);
       gtk_widget_set_size_request(inst->webview, target_w, target_h);
-      gtk_layout_move(GTK_LAYOUT(inst->clip_container), inst->webview, offset_x,
-                      offset_y);
+      SetWebviewClipBoxPassThrough(overlay, inst->clip_container,
+                                   inst->pass_through);
+      gtk_widget_queue_allocate(inst->clip_container);
       if (overlay != nullptr) {
-        gtk_overlay_set_overlay_pass_through(overlay, inst->clip_container,
-                                             FALSE);
         gtk_widget_queue_resize(GTK_WIDGET(overlay));
       }
       gtk_widget_show(inst->clip_container);
@@ -1221,9 +1963,7 @@ static void HandleMethodCall(WebviewCorePlugin* self, FlMethodCall* call) {
     const std::string html = GetStringArg(args, "html");
     bool has_base = false;
     const std::string base_url = GetStringArg(args, "baseUrl", &has_base);
-    webkit_web_view_load_html(
-        WEBKIT_WEB_VIEW(inst->webview), html.c_str(),
-        (has_base && !base_url.empty()) ? base_url.c_str() : nullptr);
+    LoadHtmlOnWebView(inst, html, has_base, base_url);
     fl_method_call_respond_success(call, nullptr, nullptr);
     return;
   }
@@ -1242,6 +1982,11 @@ static void HandleMethodCall(WebviewCorePlugin* self, FlMethodCall* call) {
     const std::string path = GetStringArg(args, "path");
     gchar* file_uri = g_filename_to_uri(path.c_str(), nullptr, nullptr);
     if (file_uri != nullptr) {
+      inst->loaded_from_html_string = false;
+      inst->in_inline_html_load = false;
+      inst->last_html.clear();
+      inst->last_base_url.clear();
+      inst->has_last_base_url = false;
       webkit_web_view_load_uri(WEBKIT_WEB_VIEW(inst->webview), file_uri);
       g_free(file_uri);
     }
@@ -1330,7 +2075,14 @@ static void HandleMethodCall(WebviewCorePlugin* self, FlMethodCall* call) {
   }
 
   if (std::strcmp(method, "reload") == 0) {
-    webkit_web_view_reload(WEBKIT_WEB_VIEW(inst->webview));
+    if (inst->loaded_from_html_string) {
+      const std::string html_copy = inst->last_html;
+      const bool has_base = inst->has_last_base_url;
+      const std::string base_copy = inst->last_base_url;
+      LoadHtmlOnWebView(inst, html_copy, has_base, base_copy);
+    } else {
+      webkit_web_view_reload(WEBKIT_WEB_VIEW(inst->webview));
+    }
     fl_method_call_respond_success(call, nullptr, nullptr);
     return;
   }
@@ -1463,11 +2215,42 @@ static void webview_core_plugin_dispose(GObject* object) {
                                  WebviewCorePlugin);
   if (self->state != nullptr) {
     self->state->instances.clear();
+    if (self->state->tracked_fl_view != nullptr) {
+      if (self->state->fl_view_press_id != 0) {
+        g_signal_handler_disconnect(self->state->tracked_fl_view,
+                                    self->state->fl_view_press_id);
+        self->state->fl_view_press_id = 0;
+      }
+      if (self->state->fl_view_destroy_id != 0) {
+        g_signal_handler_disconnect(self->state->tracked_fl_view,
+                                    self->state->fl_view_destroy_id);
+        self->state->fl_view_destroy_id = 0;
+      }
+      self->state->tracked_fl_view = nullptr;
+    }
+    if (self->state->flutter_event_box != nullptr) {
+      if (self->state->event_box_press_id != 0) {
+        g_signal_handler_disconnect(self->state->flutter_event_box,
+                                    self->state->event_box_press_id);
+        self->state->event_box_press_id = 0;
+      }
+      if (self->state->event_box_destroy_id != 0) {
+        g_signal_handler_disconnect(self->state->flutter_event_box,
+                                    self->state->event_box_destroy_id);
+        self->state->event_box_destroy_id = 0;
+      }
+      self->state->flutter_event_box = nullptr;
+    }
     if (self->state->overlay != nullptr) {
       if (self->state->child_pos_handler_id != 0) {
         g_signal_handler_disconnect(self->state->overlay,
                                     self->state->child_pos_handler_id);
         self->state->child_pos_handler_id = 0;
+      }
+      if (self->state->overlay_size_alloc_id != 0) {
+        g_signal_handler_disconnect(self->state->overlay,
+                                    self->state->overlay_size_alloc_id);
+        self->state->overlay_size_alloc_id = 0;
       }
       if (self->state->overlay_destroy_id != 0) {
         g_signal_handler_disconnect(self->state->overlay,
@@ -1499,6 +2282,11 @@ static void webview_core_plugin_init(WebviewCorePlugin* self) {
 }
 
 void webview_core_plugin_register_with_registrar(FlPluginRegistrar* registrar) {
+  // Prevent WebKitGTK's DMA-BUF EGL renderer from colliding with Flutter's
+  // Wayland EGL subsurface context (which terminates the process with Wayland
+  // protocol error 71 on NVIDIA drivers when mapping the first WebKitWebView).
+  setenv("WEBKIT_DISABLE_DMABUF_RENDERER", "1", 0);
+
   WebviewCorePlugin* plugin = static_cast<WebviewCorePlugin*>(
       g_object_new(webview_core_plugin_get_type(), nullptr));
 

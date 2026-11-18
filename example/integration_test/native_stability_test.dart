@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:ffi' as ffi;
+import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
@@ -8,6 +9,333 @@ import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 import 'package:webview_core/webview_core.dart';
+
+final class _GList extends ffi.Struct {
+  external ffi.Pointer<ffi.Void> data;
+  external ffi.Pointer<_GList> next;
+  external ffi.Pointer<_GList> prev;
+}
+
+final class _GdkEventButton extends ffi.Struct {
+  @ffi.Int32()
+  external int type;
+  external ffi.Pointer<ffi.Void> window;
+  @ffi.Int8()
+  external int sendEvent;
+  @ffi.Uint32()
+  external int time;
+  @ffi.Double()
+  external double x;
+  @ffi.Double()
+  external double y;
+  external ffi.Pointer<ffi.Double> axes;
+  @ffi.Uint32()
+  external int state;
+  @ffi.Uint32()
+  external int button;
+  external ffi.Pointer<ffi.Void> device;
+  @ffi.Double()
+  external double xRoot;
+  @ffi.Double()
+  external double yRoot;
+}
+
+class _LinuxGtkProbe {
+  _LinuxGtkProbe()
+    : _gtk = ffi.DynamicLibrary.open('libgtk-3.so.0'),
+      _gdk = ffi.DynamicLibrary.open('libgdk-3.so.0'),
+      _gobject = ffi.DynamicLibrary.open('libgobject-2.0.so.0'),
+      _glib = ffi.DynamicLibrary.open('libglib-2.0.so.0');
+
+  final ffi.DynamicLibrary _gtk;
+  final ffi.DynamicLibrary _gdk;
+  final ffi.DynamicLibrary _gobject;
+  final ffi.DynamicLibrary _glib;
+
+  late final ffi.Pointer<_GList> Function() listToplevels = _gtk
+      .lookupFunction<
+        ffi.Pointer<_GList> Function(),
+        ffi.Pointer<_GList> Function()
+      >('gtk_window_list_toplevels');
+
+  late final void Function(ffi.Pointer<_GList>) gListFree = _glib
+      .lookupFunction<
+        ffi.Void Function(ffi.Pointer<_GList>),
+        void Function(ffi.Pointer<_GList>)
+      >('g_list_free');
+
+  late final ffi.Pointer<ffi.Void> Function(ffi.Pointer<ffi.Void>) getFocus =
+      _gtk.lookupFunction<
+        ffi.Pointer<ffi.Void> Function(ffi.Pointer<ffi.Void>),
+        ffi.Pointer<ffi.Void> Function(ffi.Pointer<ffi.Void>)
+      >('gtk_window_get_focus');
+
+  late final void Function(ffi.Pointer<ffi.Void>) grabFocus = _gtk
+      .lookupFunction<
+        ffi.Void Function(ffi.Pointer<ffi.Void>),
+        void Function(ffi.Pointer<ffi.Void>)
+      >('gtk_widget_grab_focus');
+
+  late final int Function(ffi.Pointer<ffi.Void>) isFocus = _gtk
+      .lookupFunction<
+        ffi.Int32 Function(ffi.Pointer<ffi.Void>),
+        int Function(ffi.Pointer<ffi.Void>)
+      >('gtk_widget_is_focus');
+
+  late final int Function(ffi.Pointer<ffi.Void>) getMapped = _gtk
+      .lookupFunction<
+        ffi.Int32 Function(ffi.Pointer<ffi.Void>),
+        int Function(ffi.Pointer<ffi.Void>)
+      >('gtk_widget_get_mapped');
+
+  late final int Function() containerType = _gtk
+      .lookupFunction<ffi.Size Function(), int Function()>(
+        'gtk_container_get_type',
+      );
+
+  late final int Function(ffi.Pointer<ffi.Void>, int) isA = _gobject
+      .lookupFunction<
+        ffi.Int32 Function(ffi.Pointer<ffi.Void>, ffi.Size),
+        int Function(ffi.Pointer<ffi.Void>, int)
+      >('g_type_check_instance_is_a');
+
+  late final ffi.Pointer<_GList> Function(ffi.Pointer<ffi.Void>) getChildren =
+      _gtk.lookupFunction<
+        ffi.Pointer<_GList> Function(ffi.Pointer<ffi.Void>),
+        ffi.Pointer<_GList> Function(ffi.Pointer<ffi.Void>)
+      >('gtk_container_get_children');
+
+  late final ffi.Pointer<ffi.Char> Function(int) gTypeName = _gobject
+      .lookupFunction<
+        ffi.Pointer<ffi.Char> Function(ffi.Size),
+        ffi.Pointer<ffi.Char> Function(int)
+      >('g_type_name');
+
+  late final int Function(ffi.Pointer<ffi.Void>, ffi.Pointer<_GdkEventButton>)
+  widgetEvent = _gtk
+      .lookupFunction<
+        ffi.Int32 Function(ffi.Pointer<ffi.Void>, ffi.Pointer<_GdkEventButton>),
+        int Function(ffi.Pointer<ffi.Void>, ffi.Pointer<_GdkEventButton>)
+      >('gtk_widget_event');
+
+  late final ffi.Pointer<ffi.Void> Function(ffi.Pointer<ffi.Void>)
+  widgetGetWindow = _gtk
+      .lookupFunction<
+        ffi.Pointer<ffi.Void> Function(ffi.Pointer<ffi.Void>),
+        ffi.Pointer<ffi.Void> Function(ffi.Pointer<ffi.Void>)
+      >('gtk_widget_get_window');
+
+  late final ffi.Pointer<_GdkEventButton> Function(int) gdkEventNew = _gdk
+      .lookupFunction<
+        ffi.Pointer<_GdkEventButton> Function(ffi.Int32),
+        ffi.Pointer<_GdkEventButton> Function(int)
+      >('gdk_event_new');
+
+  late final void Function(ffi.Pointer<_GdkEventButton>) gdkEventFree = _gdk
+      .lookupFunction<
+        ffi.Void Function(ffi.Pointer<_GdkEventButton>),
+        void Function(ffi.Pointer<_GdkEventButton>)
+      >('gdk_event_free');
+
+  late final ffi.Pointer<ffi.Void> Function(ffi.Pointer<ffi.Void>) gObjectRef =
+      _gobject.lookupFunction<
+        ffi.Pointer<ffi.Void> Function(ffi.Pointer<ffi.Void>),
+        ffi.Pointer<ffi.Void> Function(ffi.Pointer<ffi.Void>)
+      >('g_object_ref');
+
+  late final ffi.Pointer<ffi.Void> Function() gdkDisplayGetDefault = _gdk
+      .lookupFunction<
+        ffi.Pointer<ffi.Void> Function(),
+        ffi.Pointer<ffi.Void> Function()
+      >('gdk_display_get_default');
+
+  late final ffi.Pointer<ffi.Void> Function(ffi.Pointer<ffi.Void>)
+  gdkDisplayGetDefaultSeat = _gdk
+      .lookupFunction<
+        ffi.Pointer<ffi.Void> Function(ffi.Pointer<ffi.Void>),
+        ffi.Pointer<ffi.Void> Function(ffi.Pointer<ffi.Void>)
+      >('gdk_display_get_default_seat');
+
+  late final ffi.Pointer<ffi.Void> Function(ffi.Pointer<ffi.Void>)
+  gdkSeatGetPointer = _gdk
+      .lookupFunction<
+        ffi.Pointer<ffi.Void> Function(ffi.Pointer<ffi.Void>),
+        ffi.Pointer<ffi.Void> Function(ffi.Pointer<ffi.Void>)
+      >('gdk_seat_get_pointer');
+
+  late final void Function(ffi.Pointer<_GdkEventButton>, ffi.Pointer<ffi.Void>)
+  gdkEventSetDevice = _gdk
+      .lookupFunction<
+        ffi.Void Function(ffi.Pointer<_GdkEventButton>, ffi.Pointer<ffi.Void>),
+        void Function(ffi.Pointer<_GdkEventButton>, ffi.Pointer<ffi.Void>)
+      >('gdk_event_set_device');
+
+  late final void Function(
+    ffi.Pointer<ffi.Void>,
+    ffi.Pointer<ffi.Int32>,
+    ffi.Pointer<ffi.Int32>,
+  )
+  gdkWindowGetPosition = _gdk
+      .lookupFunction<
+        ffi.Void Function(
+          ffi.Pointer<ffi.Void>,
+          ffi.Pointer<ffi.Int32>,
+          ffi.Pointer<ffi.Int32>,
+        ),
+        void Function(
+          ffi.Pointer<ffi.Void>,
+          ffi.Pointer<ffi.Int32>,
+          ffi.Pointer<ffi.Int32>,
+        )
+      >('gdk_window_get_position');
+
+  late final ffi.Pointer<ffi.Void> Function(ffi.Pointer<ffi.Void>)
+  gdkWindowGetParent = _gdk
+      .lookupFunction<
+        ffi.Pointer<ffi.Void> Function(ffi.Pointer<ffi.Void>),
+        ffi.Pointer<ffi.Void> Function(ffi.Pointer<ffi.Void>)
+      >('gdk_window_get_parent');
+
+  late final ffi.Pointer<ffi.Void> Function(int, int) _calloc =
+      ffi.DynamicLibrary.process().lookupFunction<
+        ffi.Pointer<ffi.Void> Function(ffi.Size, ffi.Size),
+        ffi.Pointer<ffi.Void> Function(int, int)
+      >('calloc');
+
+  late final void Function(ffi.Pointer<ffi.Void>) _free =
+      ffi.DynamicLibrary.process().lookupFunction<
+        ffi.Void Function(ffi.Pointer<ffi.Void>),
+        void Function(ffi.Pointer<ffi.Void>)
+      >('free');
+
+  String typeNameOf(ffi.Pointer<ffi.Void> instance) {
+    if (instance == ffi.nullptr) {
+      return '';
+    }
+    final gClass = instance.cast<ffi.Pointer<ffi.Size>>().value;
+    if (gClass == ffi.nullptr) {
+      return '';
+    }
+    final namePtr = gTypeName(gClass.value).cast<ffi.Uint8>();
+    if (namePtr == ffi.nullptr) {
+      return '';
+    }
+    final units = <int>[];
+    for (var i = 0; i < 128; i++) {
+      final b = namePtr[i];
+      if (b == 0) {
+        break;
+      }
+      units.add(b);
+    }
+    return String.fromCharCodes(units);
+  }
+
+  ffi.Pointer<ffi.Void> firstToplevelWindow() {
+    final list = listToplevels();
+    if (list == ffi.nullptr) {
+      return ffi.nullptr;
+    }
+    try {
+      var cur = list;
+      while (cur != ffi.nullptr) {
+        final w = cur.ref.data;
+        if (w != ffi.nullptr && getMapped(w) != 0) {
+          return w;
+        }
+        cur = cur.ref.next;
+      }
+      return list.ref.data;
+    } finally {
+      gListFree(list);
+    }
+  }
+
+  ffi.Pointer<ffi.Void> findByTypeName(
+    ffi.Pointer<ffi.Void> root,
+    String targetType,
+  ) {
+    if (root == ffi.nullptr) {
+      return ffi.nullptr;
+    }
+    if (typeNameOf(root) == targetType) {
+      return root;
+    }
+    if (isA(root, containerType()) == 0) {
+      return ffi.nullptr;
+    }
+    final children = getChildren(root);
+    if (children == ffi.nullptr) {
+      return ffi.nullptr;
+    }
+    try {
+      var cur = children;
+      while (cur != ffi.nullptr) {
+        final found = findByTypeName(cur.ref.data, targetType);
+        if (found != ffi.nullptr) {
+          return found;
+        }
+        cur = cur.ref.next;
+      }
+      return ffi.nullptr;
+    } finally {
+      gListFree(children);
+    }
+  }
+
+  int toplevelRelativeY(
+    ffi.Pointer<ffi.Void> widget,
+    ffi.Pointer<ffi.Void> toplevel,
+  ) {
+    final topWin = widgetGetWindow(toplevel);
+    var cur = widgetGetWindow(widget);
+    var sumY = 0;
+    final dx = _calloc(1, ffi.sizeOf<ffi.Int32>()).cast<ffi.Int32>();
+    final dy = _calloc(1, ffi.sizeOf<ffi.Int32>()).cast<ffi.Int32>();
+    try {
+      while (cur != ffi.nullptr && topWin != ffi.nullptr && cur != topWin) {
+        dx.value = 0;
+        dy.value = 0;
+        gdkWindowGetPosition(cur, dx, dy);
+        sumY += dy.value;
+        cur = gdkWindowGetParent(cur);
+      }
+      return sumY;
+    } finally {
+      _free(dx.cast());
+      _free(dy.cast());
+    }
+  }
+
+  void sendClickToWidget(ffi.Pointer<ffi.Void> widget) {
+    final gdkWin = widgetGetWindow(widget);
+    final display = gdkDisplayGetDefault();
+    final seat = display != ffi.nullptr
+        ? gdkDisplayGetDefaultSeat(display)
+        : ffi.nullptr;
+    final pointer = seat != ffi.nullptr ? gdkSeatGetPointer(seat) : ffi.nullptr;
+    for (final evType in <int>[4, 7]) {
+      final ev = gdkEventNew(evType);
+      if (ev == ffi.nullptr) {
+        continue;
+      }
+      try {
+        if (pointer != ffi.nullptr) {
+          gdkEventSetDevice(ev, pointer);
+        }
+        ev.ref
+          ..type = evType
+          ..window = gdkWin != ffi.nullptr ? gObjectRef(gdkWin) : ffi.nullptr
+          ..button = 1
+          ..x = 10.0
+          ..y = 10.0;
+        widgetEvent(widget, ev);
+      } finally {
+        gdkEventFree(ev);
+      }
+    }
+  }
+}
 
 /// Real-native regression tests (no mocked channel): they drive the actual
 /// `WKWebView` / WebKitGTK / WebView2 plugin through the same lifecycle events
@@ -681,8 +1009,226 @@ void main() {
     },
   );
 
+  testWidgets('N. focus recovery, RepaintBoundary shift, and partial popup occlusion', (
+    tester,
+  ) async {
+    Future<void> pollCondition(bool Function() predicate) async {
+      for (var i = 0; i < 60 && !predicate(); i++) {
+        await tester.pump(const Duration(milliseconds: 50));
+      }
+    }
+
+    var flutterSurfaceClicks = 0;
+    final tab = ValueNotifier<int>(0);
+    final showPopup = ValueNotifier<bool>(false);
+    final topPad = ValueNotifier<double>(48.0);
+    final c = WebViewController();
+    await c.setJavaScriptMode(JavaScriptMode.unrestricted);
+    await c.loadHtmlString(_html(14), baseUrl: _kBase);
+
+    await tester.pumpWidget(
+      Directionality(
+        textDirection: TextDirection.ltr,
+        child: ValueListenableBuilder<int>(
+          valueListenable: tab,
+          builder: (BuildContext context, int activeTab, Widget? _) {
+            return IndexedStack(
+              index: activeTab,
+              children: <Widget>[
+                ValueListenableBuilder<double>(
+                  valueListenable: topPad,
+                  builder: (BuildContext context, double top, Widget? child) {
+                    return ValueListenableBuilder<bool>(
+                      valueListenable: showPopup,
+                      builder: (BuildContext context, bool popup, Widget? web) {
+                        return Stack(
+                          children: <Widget>[
+                            Positioned(
+                              left: 0,
+                              top: 0,
+                              width: 200,
+                              height: 40,
+                              child: GestureDetector(
+                                behavior: HitTestBehavior.opaque,
+                                onTap: () => flutterSurfaceClicks++,
+                                child: const ColoredBox(
+                                  color: Color(0xFF334155),
+                                ),
+                              ),
+                            ),
+                            Positioned(
+                              left: 16,
+                              top: top,
+                              width: 320,
+                              height: 200,
+                              child: web!,
+                            ),
+                            if (popup)
+                              const Positioned(
+                                left: 120,
+                                top: 24,
+                                width: 180,
+                                height: 120,
+                                child: AbsorbPointer(
+                                  child: ColoredBox(color: Color(0xFF1E293B)),
+                                ),
+                              ),
+                          ],
+                        );
+                      },
+                      child: child,
+                    );
+                  },
+                  child: RepaintBoundary(child: WebViewWidget(controller: c)),
+                ),
+                const ColoredBox(
+                  color: Color(0xFF0F172A),
+                  child: SizedBox.expand(),
+                ),
+              ],
+            );
+          },
+        ),
+      ),
+    );
+
+    await waitForTitle(
+      tester,
+      c,
+      'T14',
+      reason: 'initial page in Test N never finished loading',
+    );
+
+    if (Platform.isLinux) {
+      final gtk = _LinuxGtkProbe();
+      final win = gtk.firstToplevelWindow();
+      final flView = gtk.findByTypeName(win, 'FlView');
+      final eventBox = gtk.findByTypeName(flView, 'GtkEventBox');
+      final clipBox = gtk.findByTypeName(flView, 'WebviewClipBox');
+      final webView = gtk.findByTypeName(flView, 'WebKitWebView');
+
+      expect(flView, isNot(ffi.nullptr));
+      expect(eventBox, isNot(ffi.nullptr));
+      expect(clipBox, isNot(ffi.nullptr));
+      expect(webView, isNot(ffi.nullptr));
+      await pollCondition(() => gtk.getMapped(clipBox) != 0);
+      expect(
+        gtk.getMapped(clipBox),
+        isNonZero,
+        reason: 'WebviewClipBox must be mapped on Wayland/X11 when visible',
+      );
+
+      // 1) Pure vertical shift across RepaintBoundary (fixed 320x200 size):
+      // native GdkWindow (including Wayland subsurface) must move by +48px.
+      final yBefore = gtk.toplevelRelativeY(clipBox, win);
+      topPad.value = 96.0;
+      await tester.pump();
+      await pollCondition(
+        () => gtk.toplevelRelativeY(clipBox, win) == yBefore + 48,
+      );
+      expect(
+        gtk.toplevelRelativeY(clipBox, win),
+        yBefore + 48,
+        reason:
+            'Pure ancestor translation across RepaintBoundary must move native overlay window',
+      );
+
+      // 2) Simulate native WebKitWebView grabbing GTK focus on user click,
+      // then click Flutter's GtkEventBox once -> FlView must reclaim focus
+      // AND deliver the click to the Flutter GestureDetector on the same tap.
+      gtk.grabFocus(webView);
+      await pollCondition(() => gtk.isFocus(webView) != 0);
+      expect(gtk.isFocus(webView), isNonZero);
+
+      final binding = tester.binding;
+      final liveBinding = binding is LiveTestWidgetsFlutterBinding
+          ? binding
+          : null;
+      final prevPropagate =
+          liveBinding?.shouldPropagateDevicePointerEvents ?? false;
+      try {
+        liveBinding?.shouldPropagateDevicePointerEvents = true;
+        gtk.sendClickToWidget(eventBox);
+        await pollCondition(
+          () => gtk.isFocus(flView) != 0 && flutterSurfaceClicks == 1,
+        );
+      } finally {
+        liveBinding?.shouldPropagateDevicePointerEvents = prevPropagate;
+      }
+      expect(
+        gtk.getFocus(win),
+        flView,
+        reason:
+            'Single click on Flutter surface must restore GTK focus to FlView',
+      );
+      expect(
+        flutterSurfaceClicks,
+        1,
+        reason:
+            'Single click on Flutter surface must also reach Flutter GestureDetector',
+      );
+
+      // 3) Grab focus onto WebKitWebView again, then hide via IndexedStack ->
+      // setGeometry(visible: false) must restore focus to FlView & unmap clipBox.
+      gtk.grabFocus(webView);
+      await pollCondition(() => gtk.isFocus(webView) != 0);
+      expect(gtk.isFocus(webView), isNonZero);
+
+      tab.value = 1;
+      await tester.pump();
+      await pollCondition(
+        () => gtk.getMapped(clipBox) == 0 && gtk.isFocus(flView) != 0,
+      );
+      expect(
+        gtk.getMapped(clipBox),
+        0,
+        reason: 'Hidden WebView clip container must unmap immediately',
+      );
+      expect(
+        gtk.getFocus(win),
+        flView,
+        reason: 'Hiding focused WebView must restore GTK focus to FlView',
+      );
+
+      // 4) Partial popup occlusion must unmap clipBox and restore when closed.
+      tab.value = 0;
+      await tester.pump();
+      await pollCondition(() => gtk.getMapped(clipBox) != 0);
+      expect(gtk.getMapped(clipBox), isNonZero);
+
+      showPopup.value = true;
+      await tester.pump();
+      await pollCondition(() => gtk.getMapped(clipBox) == 0);
+      expect(
+        gtk.getMapped(clipBox),
+        0,
+        reason: 'Partially occluding Flutter popup must unmap native overlay',
+      );
+
+      showPopup.value = false;
+      await tester.pump();
+      await pollCondition(() => gtk.getMapped(clipBox) != 0);
+      expect(gtk.getMapped(clipBox), isNonZero);
+    } else {
+      topPad.value = 96.0;
+      await tester.pump(const Duration(milliseconds: 100));
+      showPopup.value = true;
+      await tester.pump(const Duration(milliseconds: 100));
+      showPopup.value = false;
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+
+    expect(await _guard(c.evaluateJavaScript('document.title'), 'T14'), 'T14');
+
+    tab.dispose();
+    showPopup.dispose();
+    topPad.dispose();
+    await tester.pumpWidget(const SizedBox.shrink());
+    await c.dispose();
+  });
+
   testWidgets(
-    'N. macOS orphan & menu-tracking trackpad scroll phases do not crash FlutterViewController',
+    'O. macOS orphan & menu-tracking trackpad scroll phases do not crash FlutterViewController',
     (WidgetTester tester) async {
       final splitState = ValueNotifier<_SplitState>(
         const _SplitState(rightFraction: 0.5, showPreview: true, dark: true),
@@ -700,7 +1246,7 @@ void main() {
         ),
       );
       await c.loadHtmlString(
-        _html(14, body: 'ContextMenuScroll'),
+        _html(15, body: 'ContextMenuScroll'),
         baseUrl: _kBase,
       );
       await tester.pumpWidget(_SplitHarness(controller: c, state: splitState));
@@ -714,7 +1260,7 @@ void main() {
       );
 
       if (defaultTargetPlatform == TargetPlatform.macOS) {
-        await waitForTitle(tester, c, 'T14', reason: 'WKWebView ready');
+        await waitForTitle(tester, c, 'T15', reason: 'WKWebView ready');
         // Give AppKit one frame to attach InteractiveWKWebView to FlutterMutatorView.
         await tester.pump(const Duration(milliseconds: 100));
 
@@ -731,7 +1277,7 @@ void main() {
           tester,
           c,
           'document.getElementById("h").textContent',
-          'ContextMenuScroll 14',
+          'ContextMenuScroll 15',
           reason: 'WKWebView stopped responding after orphan trackpad phases',
         );
       }
