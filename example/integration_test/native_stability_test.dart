@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:ffi' as ffi;
 import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
@@ -679,4 +680,451 @@ void main() {
       await c.dispose();
     },
   );
+
+  testWidgets(
+    'N. macOS orphan & menu-tracking trackpad scroll phases do not crash FlutterViewController',
+    (WidgetTester tester) async {
+      final splitState = ValueNotifier<_SplitState>(
+        const _SplitState(rightFraction: 0.5, showPreview: true, dark: true),
+      );
+      final c = WebViewController();
+      final finished = Completer<void>();
+      await c.setJavaScriptMode(JavaScriptMode.unrestricted);
+      await c.setNavigationDelegate(
+        NavigationDelegate(
+          onPageFinished: (_) {
+            if (!finished.isCompleted) {
+              finished.complete();
+            }
+          },
+        ),
+      );
+      await c.loadHtmlString(
+        _html(14, body: 'ContextMenuScroll'),
+        baseUrl: _kBase,
+      );
+      await tester.pumpWidget(_SplitHarness(controller: c, state: splitState));
+      for (var i = 0; i < 60 && !finished.isCompleted; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      expect(
+        finished.isCompleted,
+        isTrue,
+        reason: 'initial page never finished',
+      );
+
+      if (defaultTargetPlatform == TargetPlatform.macOS) {
+        await waitForTitle(tester, c, 'T14', reason: 'WKWebView ready');
+        // Give AppKit one frame to attach InteractiveWKWebView to FlutterMutatorView.
+        await tester.pump(const Duration(milliseconds: 100));
+
+        final sentCount = _exerciseMacOSOrphanTrackpadScrollPhases();
+        expect(
+          sentCount,
+          12,
+          reason:
+              'Failed to synthesize all 12 orphan and NSEventTrackingRunLoopMode scroll phases',
+        );
+        await tester.pump(const Duration(milliseconds: 100));
+
+        await waitForJs(
+          tester,
+          c,
+          'document.getElementById("h").textContent',
+          'ContextMenuScroll 14',
+          reason: 'WKWebView stopped responding after orphan trackpad phases',
+        );
+      }
+
+      await tester.pumpWidget(const SizedBox.shrink());
+      await c.dispose();
+      splitState.dispose();
+    },
+  );
+}
+
+typedef _ObjcGetClassNative =
+    ffi.Pointer<ffi.Void> Function(ffi.Pointer<ffi.Char>);
+typedef _ObjcGetClassDart =
+    ffi.Pointer<ffi.Void> Function(ffi.Pointer<ffi.Char>);
+typedef _SelRegisterNameNative =
+    ffi.Pointer<ffi.Void> Function(ffi.Pointer<ffi.Char>);
+typedef _SelRegisterNameDart =
+    ffi.Pointer<ffi.Void> Function(ffi.Pointer<ffi.Char>);
+typedef _MsgSend0Native =
+    ffi.Pointer<ffi.Void> Function(
+      ffi.Pointer<ffi.Void>,
+      ffi.Pointer<ffi.Void>,
+    );
+typedef _MsgSend0Dart =
+    ffi.Pointer<ffi.Void> Function(
+      ffi.Pointer<ffi.Void>,
+      ffi.Pointer<ffi.Void>,
+    );
+typedef _MsgSendPtrNative =
+    ffi.Pointer<ffi.Void> Function(
+      ffi.Pointer<ffi.Void>,
+      ffi.Pointer<ffi.Void>,
+      ffi.Pointer<ffi.Void>,
+    );
+typedef _MsgSendPtrDart =
+    ffi.Pointer<ffi.Void> Function(
+      ffi.Pointer<ffi.Void>,
+      ffi.Pointer<ffi.Void>,
+      ffi.Pointer<ffi.Void>,
+    );
+typedef _MsgSendVoidPtrNative =
+    ffi.Void Function(
+      ffi.Pointer<ffi.Void>,
+      ffi.Pointer<ffi.Void>,
+      ffi.Pointer<ffi.Void>,
+    );
+typedef _MsgSendVoidPtrDart =
+    void Function(
+      ffi.Pointer<ffi.Void>,
+      ffi.Pointer<ffi.Void>,
+      ffi.Pointer<ffi.Void>,
+    );
+typedef _MsgSendCountNative =
+    ffi.Uint64 Function(ffi.Pointer<ffi.Void>, ffi.Pointer<ffi.Void>);
+typedef _MsgSendCountDart =
+    int Function(ffi.Pointer<ffi.Void>, ffi.Pointer<ffi.Void>);
+typedef _MsgSendIndexNative =
+    ffi.Pointer<ffi.Void> Function(
+      ffi.Pointer<ffi.Void>,
+      ffi.Pointer<ffi.Void>,
+      ffi.Uint64,
+    );
+typedef _MsgSendIndexDart =
+    ffi.Pointer<ffi.Void> Function(
+      ffi.Pointer<ffi.Void>,
+      ffi.Pointer<ffi.Void>,
+      int,
+    );
+typedef _MsgSendBoolPtrNative =
+    ffi.Bool Function(
+      ffi.Pointer<ffi.Void>,
+      ffi.Pointer<ffi.Void>,
+      ffi.Pointer<ffi.Void>,
+    );
+typedef _MsgSendBoolPtrDart =
+    bool Function(
+      ffi.Pointer<ffi.Void>,
+      ffi.Pointer<ffi.Void>,
+      ffi.Pointer<ffi.Void>,
+    );
+typedef _CallocNative = ffi.Pointer<ffi.Char> Function(ffi.Size, ffi.Size);
+typedef _CallocDart = ffi.Pointer<ffi.Char> Function(int, int);
+typedef _FreeNative = ffi.Void Function(ffi.Pointer<ffi.Void>);
+typedef _FreeDart = void Function(ffi.Pointer<ffi.Void>);
+typedef _CGCreateScroll2Native =
+    ffi.Pointer<ffi.Void> Function(
+      ffi.Pointer<ffi.Void>,
+      ffi.Uint32,
+      ffi.Uint32,
+      ffi.Int32,
+      ffi.Int32,
+      ffi.Int32,
+    );
+typedef _CGCreateScroll2Dart =
+    ffi.Pointer<ffi.Void> Function(
+      ffi.Pointer<ffi.Void>,
+      int,
+      int,
+      int,
+      int,
+      int,
+    );
+typedef _CGSetIntFieldNative =
+    ffi.Void Function(ffi.Pointer<ffi.Void>, ffi.Uint32, ffi.Int64);
+typedef _CGSetIntFieldDart = void Function(ffi.Pointer<ffi.Void>, int, int);
+typedef _CFReleaseNative = ffi.Void Function(ffi.Pointer<ffi.Void>);
+typedef _CFReleaseDart = void Function(ffi.Pointer<ffi.Void>);
+typedef _CFStrMakeNative =
+    ffi.Pointer<ffi.Void> Function(
+      ffi.Pointer<ffi.Void>,
+      ffi.Pointer<ffi.Char>,
+      ffi.Uint32,
+    );
+typedef _CFStrMakeDart =
+    ffi.Pointer<ffi.Void> Function(
+      ffi.Pointer<ffi.Void>,
+      ffi.Pointer<ffi.Char>,
+      int,
+    );
+typedef _CFRunLoopGetCurrentNative = ffi.Pointer<ffi.Void> Function();
+typedef _CFRunLoopGetCurrentDart = ffi.Pointer<ffi.Void> Function();
+typedef _CFAbsoluteTimeGetCurrentNative = ffi.Double Function();
+typedef _CFAbsoluteTimeGetCurrentDart = double Function();
+typedef _CFTimerCallBackNative =
+    ffi.Void Function(ffi.Pointer<ffi.Void>, ffi.Pointer<ffi.Void>);
+typedef _CFRunLoopTimerCreateNative =
+    ffi.Pointer<ffi.Void> Function(
+      ffi.Pointer<ffi.Void>,
+      ffi.Double,
+      ffi.Double,
+      ffi.Uint64,
+      ffi.Int64,
+      ffi.Pointer<ffi.NativeFunction<_CFTimerCallBackNative>>,
+      ffi.Pointer<ffi.Void>,
+    );
+typedef _CFRunLoopTimerCreateDart =
+    ffi.Pointer<ffi.Void> Function(
+      ffi.Pointer<ffi.Void>,
+      double,
+      double,
+      int,
+      int,
+      ffi.Pointer<ffi.NativeFunction<_CFTimerCallBackNative>>,
+      ffi.Pointer<ffi.Void>,
+    );
+typedef _CFRunLoopAddTimerNative =
+    ffi.Void Function(
+      ffi.Pointer<ffi.Void>,
+      ffi.Pointer<ffi.Void>,
+      ffi.Pointer<ffi.Void>,
+    );
+typedef _CFRunLoopAddTimerDart =
+    void Function(
+      ffi.Pointer<ffi.Void>,
+      ffi.Pointer<ffi.Void>,
+      ffi.Pointer<ffi.Void>,
+    );
+typedef _CFRunLoopRunInModeNative =
+    ffi.Int32 Function(ffi.Pointer<ffi.Void>, ffi.Double, ffi.Uint8);
+typedef _CFRunLoopRunInModeDart =
+    int Function(ffi.Pointer<ffi.Void>, double, int);
+typedef _CFRunLoopStopNative = ffi.Void Function(ffi.Pointer<ffi.Void>);
+typedef _CFRunLoopStopDart = void Function(ffi.Pointer<ffi.Void>);
+
+/// Synthesizes real AppKit `NSEvent` continuous trackpad scroll events along
+/// the exact crash responder chain (`FlutterView` -> `FlutterViewWrapper` ->
+/// `FlutterViewController`) without a prior `NSEventPhaseBegan`:
+/// 1. Orphan `kCGScrollPhaseChanged` (`NSEventPhaseChanged`)
+/// 2. Orphan `kCGScrollPhaseEnded` (`NSEventPhaseEnded` — triggers
+///    `FlutterViewController.mm:665` `NSAssert` when unguarded)
+/// 3. Complete `Began` -> `Changed` -> `Ended` valid trackpad scroll sequence
+///    followed by another orphan `Ended` to verify shadow state reset.
+int _exerciseMacOSOrphanTrackpadScrollPhases() {
+  final objc = ffi.DynamicLibrary.open('/usr/lib/libobjc.A.dylib');
+  final cg = ffi.DynamicLibrary.open(
+    '/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics',
+  );
+  final cf = ffi.DynamicLibrary.open(
+    '/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation',
+  );
+  final proc = ffi.DynamicLibrary.process();
+
+  final callocFn = proc.lookupFunction<_CallocNative, _CallocDart>('calloc');
+  final freeFn = proc.lookupFunction<_FreeNative, _FreeDart>('free');
+  final getClass = objc.lookupFunction<_ObjcGetClassNative, _ObjcGetClassDart>(
+    'objc_getClass',
+  );
+  final selReg = objc
+      .lookupFunction<_SelRegisterNameNative, _SelRegisterNameDart>(
+        'sel_registerName',
+      );
+  final msgSendAddr = objc.lookup<ffi.Void>('objc_msgSend').address;
+  final msg0 = ffi.Pointer<ffi.NativeFunction<_MsgSend0Native>>.fromAddress(
+    msgSendAddr,
+  ).asFunction<_MsgSend0Dart>();
+  final msgPtr = ffi.Pointer<ffi.NativeFunction<_MsgSendPtrNative>>.fromAddress(
+    msgSendAddr,
+  ).asFunction<_MsgSendPtrDart>();
+  final msgVoidPtr =
+      ffi.Pointer<ffi.NativeFunction<_MsgSendVoidPtrNative>>.fromAddress(
+        msgSendAddr,
+      ).asFunction<_MsgSendVoidPtrDart>();
+  final msgCount =
+      ffi.Pointer<ffi.NativeFunction<_MsgSendCountNative>>.fromAddress(
+        msgSendAddr,
+      ).asFunction<_MsgSendCountDart>();
+  final msgIndex =
+      ffi.Pointer<ffi.NativeFunction<_MsgSendIndexNative>>.fromAddress(
+        msgSendAddr,
+      ).asFunction<_MsgSendIndexDart>();
+  final msgBoolPtr =
+      ffi.Pointer<ffi.NativeFunction<_MsgSendBoolPtrNative>>.fromAddress(
+        msgSendAddr,
+      ).asFunction<_MsgSendBoolPtrDart>();
+
+  final cgCreateScroll2 = cg
+      .lookupFunction<_CGCreateScroll2Native, _CGCreateScroll2Dart>(
+        'CGEventCreateScrollWheelEvent2',
+      );
+  final cgSetIntField = cg
+      .lookupFunction<_CGSetIntFieldNative, _CGSetIntFieldDart>(
+        'CGEventSetIntegerValueField',
+      );
+  final cfRelease = cf.lookupFunction<_CFReleaseNative, _CFReleaseDart>(
+    'CFRelease',
+  );
+  final cfStrCreate = cf.lookupFunction<_CFStrMakeNative, _CFStrMakeDart>(
+    'CFStringCreateWithCString',
+  );
+  final cfRunLoopGetCurrent = cf
+      .lookupFunction<_CFRunLoopGetCurrentNative, _CFRunLoopGetCurrentDart>(
+        'CFRunLoopGetCurrent',
+      );
+  final cfAbsTime = cf
+      .lookupFunction<
+        _CFAbsoluteTimeGetCurrentNative,
+        _CFAbsoluteTimeGetCurrentDart
+      >('CFAbsoluteTimeGetCurrent');
+  final cfTimerCreate = cf
+      .lookupFunction<_CFRunLoopTimerCreateNative, _CFRunLoopTimerCreateDart>(
+        'CFRunLoopTimerCreate',
+      );
+  final cfAddTimer = cf
+      .lookupFunction<_CFRunLoopAddTimerNative, _CFRunLoopAddTimerDart>(
+        'CFRunLoopAddTimer',
+      );
+  final cfRunInMode = cf
+      .lookupFunction<_CFRunLoopRunInModeNative, _CFRunLoopRunInModeDart>(
+        'CFRunLoopRunInMode',
+      );
+  final cfRunLoopStop = cf
+      .lookupFunction<_CFRunLoopStopNative, _CFRunLoopStopDart>(
+        'CFRunLoopStop',
+      );
+
+  T withCStr<T>(String s, T Function(ffi.Pointer<ffi.Char>) body) {
+    final units = s.codeUnits;
+    final buf = callocFn(units.length + 1, 1);
+    for (var i = 0; i < units.length; i++) {
+      (buf + i).cast<ffi.Uint8>().value = units[i];
+    }
+    try {
+      return body(buf);
+    } finally {
+      freeFn(buf.cast());
+    }
+  }
+
+  ffi.Pointer<ffi.Void> cls(String name) => withCStr(name, getClass);
+  ffi.Pointer<ffi.Void> sel(String name) => withCStr(name, selReg);
+
+  final nsAppClass = cls('NSApplication');
+  final fvcClass = cls('FlutterViewController');
+  final nsEventClass = cls('NSEvent');
+  if (nsAppClass == ffi.nullptr ||
+      fvcClass == ffi.nullptr ||
+      nsEventClass == ffi.nullptr) {
+    return 0;
+  }
+
+  final sharedApp = msg0(nsAppClass, sel('sharedApplication'));
+  final windows = msg0(sharedApp, sel('windows'));
+  final winCount = msgCount(windows, sel('count'));
+  final selContentVC = sel('contentViewController');
+  final selIsKindOf = sel('isKindOfClass:');
+  final selView = sel('view');
+  final selSubviews = sel('subviews');
+  final selObjectAtIndex = sel('objectAtIndex:');
+  final selScrollWheel = sel('scrollWheel:');
+  final selEventWithCG = sel('eventWithCGEvent:');
+
+  var flutterView = ffi.Pointer<ffi.Void>.fromAddress(0);
+  for (var i = 0; i < winCount; i++) {
+    final win = msgIndex(windows, selObjectAtIndex, i);
+    final vc = msg0(win, selContentVC);
+    if (vc != ffi.nullptr && msgBoolPtr(vc, selIsKindOf, fvcClass)) {
+      final wrapper = msg0(vc, selView);
+      final subs = msg0(wrapper, selSubviews);
+      if (subs != ffi.nullptr && msgCount(subs, sel('count')) > 0) {
+        flutterView = msgIndex(subs, selObjectAtIndex, 0);
+        break;
+      }
+    }
+  }
+  if (flutterView == ffi.nullptr) {
+    return 0;
+  }
+
+  void sendScrollPhase(int cgScrollPhase, {int dy = -4, int dx = 0}) {
+    // kCGScrollEventUnitPixel = 0, wheelCount = 2
+    final cgEv = cgCreateScroll2(ffi.nullptr, 0, 2, dy, dx, 0);
+    if (cgEv == ffi.nullptr) {
+      return;
+    }
+    try {
+      // kCGScrollWheelEventIsContinuous = 88, kCGScrollWheelEventScrollPhase = 99
+      cgSetIntField(cgEv, 88, 1);
+      cgSetIntField(cgEv, 99, cgScrollPhase);
+      final nsEv = msgPtr(nsEventClass, selEventWithCG, cgEv);
+      if (nsEv != ffi.nullptr) {
+        msgVoidPtr(flutterView, selScrollWheel, nsEv);
+      }
+    } finally {
+      cfRelease(cgEv);
+    }
+  }
+
+  // kCGScrollPhaseBegan = 1, Changed = 2, Ended = 4, Cancelled = 8, MayBegin = 128
+  // 1) Orphan Changed + Ended (exact NSMenuTrackingSession / WKWebView boundary crash).
+  sendScrollPhase(2);
+  sendScrollPhase(4);
+  // 2) Valid full gesture Began -> Changed -> Ended on FlutterView.
+  sendScrollPhase(1);
+  sendScrollPhase(2);
+  sendScrollPhase(4);
+  // 3) Second orphan Ended after valid gesture reset to prove shadow state also reset.
+  sendScrollPhase(4);
+  // 4) MayBegin -> Cancelled -> orphan Ended.
+  sendScrollPhase(128);
+  sendScrollPhase(8);
+  sendScrollPhase(4);
+
+  // 5) Simulate modal NSMenu tracking (RunLoop.current.currentMode == .eventTracking):
+  //    Began sent inside NSEventTrackingRunLoopMode is suppressed, and a subsequent
+  //    Ended outside menu tracking must also be suppressed without crashing.
+  var menuModeFired = false;
+  final currentRl = cfRunLoopGetCurrent();
+  final timerCb = ffi.NativeCallable<_CFTimerCallBackNative>.isolateLocal((
+    ffi.Pointer<ffi.Void> _,
+    ffi.Pointer<ffi.Void> __,
+  ) {
+    menuModeFired = true;
+    sendScrollPhase(1);
+    sendScrollPhase(2);
+    cfRunLoopStop(currentRl);
+  });
+  try {
+    // kCFStringEncodingUTF8 = 0x08000100
+    final modeStr = withCStr(
+      'NSEventTrackingRunLoopMode',
+      (ffi.Pointer<ffi.Char> p) => cfStrCreate(ffi.nullptr, p, 0x08000100),
+    );
+    if (modeStr != ffi.nullptr) {
+      try {
+        final timer = cfTimerCreate(
+          ffi.nullptr,
+          cfAbsTime() - 1.0,
+          0,
+          0,
+          0,
+          timerCb.nativeFunction,
+          ffi.nullptr,
+        );
+        if (timer != ffi.nullptr) {
+          try {
+            cfAddTimer(currentRl, timer, modeStr);
+            cfRunInMode(modeStr, 0.25, 0);
+          } finally {
+            cfRelease(timer);
+          }
+        }
+      } finally {
+        cfRelease(modeStr);
+      }
+    }
+  } finally {
+    timerCb.close();
+  }
+  if (!menuModeFired) {
+    return 0;
+  }
+  // Finger lift arriving right after NSMenuTrackingSession exits:
+  sendScrollPhase(4);
+  return 12;
 }

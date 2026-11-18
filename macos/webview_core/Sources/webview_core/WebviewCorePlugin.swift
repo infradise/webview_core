@@ -1,6 +1,146 @@
 import Cocoa
 import FlutterMacOS
+import ObjectiveC.runtime
 import WebKit
+
+/// Guards `FlutterViewController` against unstarted or menu-tracking trackpad
+/// gesture phases (`NSEvent.Phase`).
+///
+/// When `WKWebView` opens a native context menu (`NSMenuTrackingSession` above
+/// WebKit's `-fno-exceptions` C++ frames) or consumes `NSEvent.Phase.began`
+/// before the pointer crosses onto `FlutterView`, subsequent `.changed`,
+/// `.ended`, or `.stationary` events arriving on `FlutterViewController` hit an
+/// active `NSAssert` in `FlutterViewController.mm` (shipped in Debug, Profile,
+/// and Release builds of Flutter 3.50.0), causing `objc_exception_rethrow` ->
+/// `std::__terminate()` (`SIGABRT`).
+///
+/// Note: AppKit's `NSView` owned by an `NSViewController` routes responder
+/// `forwardMethod` calls directly to `_viewController`, bypassing custom
+/// `view.nextResponder` assignments. Wrapping the public `NSResponder` gesture
+/// selectors on `FlutterViewController` guarantees every incoming trackpad
+/// gesture event is validated before `dispatchGestureEvent:` runs, without
+/// requiring any changes in the host application's `MainFlutterWindow`.
+private final class FlutterGesturePhaseGuard {
+  private static var associatedStateKey: UInt8 = 0
+  private static var installed = false
+
+  private var isPanZoomStarted = false
+  private var panGesturePhase: NSEvent.Phase = []
+  private var scaleGesturePhase: NSEvent.Phase = []
+  private var rotateGesturePhase: NSEvent.Phase = []
+
+  static func installIfNeeded() {
+    guard !installed else { return }
+    installed = true
+    let cls: AnyClass = FlutterViewController.self
+    hookGestureSelector(#selector(NSResponder.scrollWheel(with:)), on: cls)
+    hookGestureSelector(#selector(NSResponder.magnify(with:)), on: cls)
+    hookGestureSelector(#selector(NSResponder.rotate(with:)), on: cls)
+  }
+
+  private static func hookGestureSelector(_ selector: Selector, on cls: AnyClass) {
+    guard let method = class_getInstanceMethod(cls, selector) else { return }
+    let originalImp = method_getImplementation(method)
+    typealias OriginalFn = @convention(c) (AnyObject, Selector, NSEvent) -> Void
+    let original = unsafeBitCast(originalImp, to: OriginalFn.self)
+
+    let block: @convention(block) (AnyObject, NSEvent) -> Void = { receiver, event in
+      guard let controller = receiver as? FlutterViewController else {
+        original(receiver, selector, event)
+        return
+      }
+      let state = guardState(for: controller)
+      if state.shouldForward(event) {
+        original(receiver, selector, event)
+      }
+    }
+
+    let newImp = imp_implementationWithBlock(block)
+    if !class_addMethod(cls, selector, newImp, method_getTypeEncoding(method)) {
+      method_setImplementation(method, newImp)
+    }
+  }
+
+  private static func guardState(for controller: FlutterViewController) -> FlutterGesturePhaseGuard {
+    if let existing = objc_getAssociatedObject(controller, &associatedStateKey)
+      as? FlutterGesturePhaseGuard
+    {
+      return existing
+    }
+    let created = FlutterGesturePhaseGuard()
+    objc_setAssociatedObject(
+      controller,
+      &associatedStateKey,
+      created,
+      .OBJC_ASSOCIATION_RETAIN_NONATOMIC
+    )
+    return created
+  }
+
+  private func resetGestureState() {
+    isPanZoomStarted = false
+    panGesturePhase = []
+    scaleGesturePhase = []
+    rotateGesturePhase = []
+  }
+
+  private func recordPhase(_ phase: NSEvent.Phase, for type: NSEvent.EventType) {
+    switch type {
+    case .scrollWheel:
+      panGesturePhase = phase
+    case .magnify:
+      scaleGesturePhase = phase
+    case .rotate:
+      rotateGesturePhase = phase
+    default:
+      break
+    }
+  }
+
+  private func shouldForward(_ event: NSEvent) -> Bool {
+    let phase = event.phase
+    let momentum = event.momentumPhase
+    let inMenuTracking = RunLoop.current.currentMode == .eventTracking
+
+    if inMenuTracking && !isPanZoomStarted {
+      return false
+    }
+
+    if phase == .began || phase == .mayBegin {
+      recordPhase(phase, for: event.type)
+      isPanZoomStarted = true
+      return true
+    }
+
+    if phase == .changed {
+      return isPanZoomStarted
+    }
+
+    if phase == .ended || phase == .cancelled {
+      guard isPanZoomStarted else {
+        resetGestureState()
+        return false
+      }
+      recordPhase(phase, for: event.type)
+      let allPhases = panGesturePhase.union(scaleGesturePhase).union(rotateGesturePhase)
+      let activeMask: NSEvent.Phase = [.began, .changed]
+      if allPhases.intersection(activeMask).isEmpty {
+        resetGestureState()
+      }
+      return true
+    }
+
+    if phase.isEmpty && momentum.isEmpty {
+      return true
+    }
+
+    if phase.isEmpty && !momentum.isEmpty {
+      return true
+    }
+
+    return false
+  }
+}
 
 private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
   weak var target: WKScriptMessageHandler?
@@ -51,6 +191,7 @@ public class WebviewCorePlugin: NSObject, FlutterPlugin {
   }
 
   public static func register(with registrar: FlutterPluginRegistrar) {
+    FlutterGesturePhaseGuard.installIfNeeded()
     let channel = FlutterMethodChannel(
       name: "com.infradise.webview_core",
       binaryMessenger: registrar.messenger
