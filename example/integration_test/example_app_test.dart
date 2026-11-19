@@ -24,7 +24,7 @@ void main() {
       evalTaps++;
       await tester.pump(const Duration(milliseconds: 500));
       final answer = find.textContaining(
-        'document.title = keyscope.dev (sample SSR page) (eval #$evalTaps)',
+        'document.title = example.com (sample SSR page) (eval #$evalTaps)',
       );
       if (answer.evaluate().isNotEmpty) {
         return true;

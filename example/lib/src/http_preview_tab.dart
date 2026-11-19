@@ -6,8 +6,8 @@ import 'package:webview_core/webview_core.dart';
 import 'demo_model.dart';
 import 'ui.dart';
 
-/// Reproduces Keyscope's `HTTP Client > Preview`: an HTTP response body rendered
-/// with its request URL as `baseUrl`, optionally with `<script>` tags removed.
+/// Demonstrates an HTTP response preview: renders an HTML response body with
+/// its request URL as `baseUrl`, optionally stripping `<script>` tags.
 class HttpPreviewTab extends StatefulWidget {
   /// Creates the tab.
   const HttpPreviewTab({required this.model, super.key});
@@ -20,10 +20,10 @@ class HttpPreviewTab extends StatefulWidget {
 }
 
 class _HttpPreviewTabState extends State<HttpPreviewTab> {
-  static const String _kSampleBase = 'https://keyscope.dev/docs/';
+  static const String _kSampleBase = 'https://example.com/docs/';
 
   final TextEditingController _url = TextEditingController(
-    text: 'https://keyscope.dev',
+    text: 'https://example.com',
   );
   final FocusNode _urlFocus = FocusNode(debugLabel: 'httpUrl');
   bool _stripScripts = true;
@@ -226,7 +226,7 @@ const String _sampleHtml = '''
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>keyscope.dev (sample SSR page)</title>
+  <title>example.com (sample SSR page)</title>
   <link rel="icon" href="/favicon.ico">
   <style>
     body { margin: 0; font-family: -apple-system, "Segoe UI", sans-serif; background: #fff; }
@@ -240,10 +240,10 @@ const String _sampleHtml = '''
 </head>
 <body>
   <header>
-    <strong>Keyscope</strong>
+    <strong>Example</strong>
     <nav>
       <a href="#features">Features</a>
-      <a href="https://keyscope.dev/pricing" target="_blank">Pricing (target=_blank)</a>
+      <a href="https://example.com/pricing" target="_blank">Pricing (target=_blank)</a>
     </nav>
     <button id="burger" onclick="document.getElementById('menu').style.display='block'">Menu</button>
   </header>
@@ -253,7 +253,7 @@ const String _sampleHtml = '''
     <p>Static SSR-style document. Links work without JavaScript; the Menu button
        only works when scripts are kept (toggle "Scripts" above).</p>
     <p><a href="#features">Anchor link</a> &middot;
-       <a href="https://keyscope.dev/docs" target="_blank">Docs (opens in place)</a></p>
+       <a href="https://example.com/docs" target="_blank">Docs (opens in place)</a></p>
   </main>
 </body>
 </html>

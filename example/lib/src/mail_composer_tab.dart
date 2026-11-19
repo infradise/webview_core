@@ -6,12 +6,12 @@ import 'package:webview_core/webview_core.dart';
 import 'demo_model.dart';
 import 'ui.dart';
 
-/// Reproduces Keyscope's `Mail Sender`: a raw HTML editor on the left and a live
-/// WebView preview on the right.
+/// Demonstrates a live HTML email composer: a raw HTML editor on the left and a
+/// live WebView preview on the right.
 ///
-/// The preview theme (`<style id="keyscope-preview-theme">`) is added **only** to
-/// the string handed to `loadHtmlString`. The editor text — the exact payload a
-/// real "Send" would transmit — is never modified.
+/// The preview theme (`<style id="webview-preview-theme">`) is added **only**
+/// to the string handed to `loadHtmlString`. The editor text — the exact
+/// payload a real "Send" would transmit — is never modified.
 class MailComposerTab extends StatefulWidget {
   /// Creates the tab.
   const MailComposerTab({required this.model, super.key});
@@ -25,12 +25,12 @@ class MailComposerTab extends StatefulWidget {
 
 class _MailComposerTabState extends State<MailComposerTab> {
   static const Duration _debounce = Duration(milliseconds: 80);
-  static const String _themeStyleId = 'keyscope-preview-theme';
+  static const String _themeStyleId = 'webview-preview-theme';
 
   final TextEditingController _editor = TextEditingController(
     text:
-        '<h2>Keyscope Update</h2>\n'
-        '<p>Notice for waitlist subscribers.</p>\n'
+        '<h2>Product Update</h2>\n'
+        '<p>Notice for newsletter subscribers.</p>\n'
         '<div style="background:#ffffff;padding:12px">'
         '<p>White card without an explicit text color.</p></div>',
   );

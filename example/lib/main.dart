@@ -13,10 +13,9 @@ void main() {
 
 /// Example application built exclusively with `package:flutter/widgets.dart`.
 ///
-/// It mirrors the two Keyscope screens that embed `webview_core`:
-/// an `HTTP Client` response preview and a `Mail Sender` live preview, both kept
-/// mounted inside an `IndexedStack` so tab switches exercise the hide/show
-/// lifecycle that previously froze the native view.
+/// Demonstrates an HTTP response preview and a live HTML email preview kept
+/// mounted inside an `IndexedStack`, alongside a Diagnostics tab to exercise
+/// hide/show, resize, and reload lifecycles.
 class WebViewCoreExampleApp extends StatelessWidget {
   /// Creates the example application.
   const WebViewCoreExampleApp({super.key});

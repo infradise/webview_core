@@ -338,8 +338,8 @@ class _LinuxGtkProbe {
 }
 
 /// Real-native regression tests (no mocked channel): they drive the actual
-/// `WKWebView` / WebKitGTK / WebView2 plugin through the same lifecycle events
-/// Keyscope produces (tab hide/show, remounts, rounded clips, resize, theme
+/// `WKWebView` / WebKitGTK / WebView2 plugin through typical multi-tab desktop
+/// app lifecycles (tab hide/show, remounts, rounded clips, resize, theme
 /// toggles, rapid HTML reloads).
 const String _kBase = 'https://webview-core-test.invalid/docs/';
 

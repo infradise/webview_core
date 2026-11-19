@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name             = 'webview_core'
-  s.version          = '1.0.0'
+  s.version          = '1.1.0'
   s.summary          = 'Zero-dependency native WebView plugin for Flutter.'
   s.description      = <<-DESC
 Native WebView plugin for Flutter across Android, iOS, Linux, macOS, Windows, and Web with zero external hosted dependencies.
